@@ -1,12 +1,53 @@
 # Testing and Quality Gates
 
-> **Who this is for**: Engineers deciding what must pass before merge, promotion, and release. Read [Branching and Production Change Control](02_branching_and_change_control.md) first.
+> **Who this is for**: Engineers deciding what must pass before merge, promotion, and release.
+
+## The short version
+
+GitHub branch protection can only require a check by its exact job name, but a real CI workflow has several jobs whose names or count can shift between runs. The fix is one aggregator job with a single fixed name that reads its upstream jobs' results and becomes the only thing branch protection requires. Two upstream jobs plus that aggregator are enough to prove the merge-blocking mechanism end to end — every other test layer in this note plugs into the same aggregator later.
+
+**What you need (3 things):**
+
+1. Two independent check jobs in one workflow (here, `lint` and `unit`).
+2. One aggregator job — named `required-ci` — that runs after them and reduces their results to a single pass/fail.
+3. A branch protection ruleset that requires exactly the name `required-ci`, not the jobs behind it.
+
+**The code:**
+
+```yaml
+name: ci
+on: pull_request
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "lint: 0 issues"     # stands in for a real linter
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "unit: 42 passed"    # stands in for a real test runner
+
+  required-ci:
+    name: required-ci
+    needs: [lint, unit]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "required-ci: lint and unit both succeeded"
+```
+
+**Success signal:** On a test PR, the merge box shows `required-ci` pending, then green once `lint` and `unit` both succeed. If either fails, GitHub skips `required-ci` (a `needs` dependency didn't succeed) and the merge box leaves it unresolved — the PR still can't merge, but the aggregator itself never explains why.
+
+**Not handled yet:** [optional and matrix-shaped jobs](#3-harden-the-required-check-so-a-skipped-job-cannot-pass-it), [testing only the changed part of a monorepo](#4-directory-filters-miss-consumers-whose-own-path-did-not-change), [flaky-test policy](#5-a-flaky-test-is-a-defect-not-noise-to-rerun-away), [preview-environment cleanup](#7-cleanup-must-refuse-a-bad-identifier-before-it-deletes-anything).
 
 ---
 
-## 1. Build a Risk-Based Test Portfolio
+This assumes you can already read a branch-protection ruleset and know what `CODEOWNERS` and a merge queue do; see [Branching and Production Change Control](02_branching_and_change_control.md) for those.
 
-No single test suite proves release safety. Each layer finds a different class of defect at a different cost.
+## 1. Most Test Layers Are Conditional; Three Run on Every PR
+
+No single test suite proves release safety. Each layer finds a different class of defect at a different cost. A **unit test** exercises one function or class in isolation — cheap, and it catches wrong logic before anything is deployed, though a bug that only appears when two services talk to each other is outside what it can see. A **component test** runs a service against its real dependencies — an actual Postgres instance or Redis cache in CI, not a mock — and catches a broken query or serialization mismatch that a mocked dependency would hide. An **integration test** goes one step further and exercises deployed components together, including managed-service integrations, catching wiring problems no single service's tests would surface. A **contract test** checks that a producer's API and a consumer's expectation of it still agree, without deploying either side, and catches a breaking API change before the two services ever meet in a shared environment. A **synthetic journey** is a scripted, production-like user flow — log in, add to cart, check out — run continuously against the real system, and it catches degradation that only real infrastructure, real latency, and real data surface.
 
 ```text
                          ┌──────────────────────┐
@@ -21,22 +62,28 @@ No single test suite proves release safety. Each layer finds a different class o
              fast and numerous                  slow and focused
 ```
 
-| Layer | Detects | Typical timing |
-|-------|---------|----------------|
-| Format, lint, type checks | Local consistency and invalid interfaces | Seconds; first on PR |
-| Unit tests | Logic and boundary behavior | Every PR |
-| Component tests | Service behavior with a database, queue, or cache | Every PR or affected paths |
-| Contract tests | Producer/consumer compatibility | PR and package publication |
-| Integration tests | Deployed components and managed-service integration | Staging or preview |
-| Smoke tests | Critical endpoint availability | Every deployment |
-| Synthetic journeys | User-visible and business behavior | After rollout and continuously |
-| Performance/resilience | Capacity, latency, timeout, and degradation behavior | Scheduled or before risky releases |
+In practice, every PR runs three of these — format/lint, unit, and component tests (★ below); the rest are conditional on architecture, delivery stage, or release risk.
+
+| Layer | Detects | Typical timing | On every PR? |
+|-------|---------|----------------|--------------|
+| **Format, lint, type checks** | Local consistency and invalid interfaces | Seconds; first on PR | **★ Always** |
+| **Unit tests** | Logic and boundary behavior | Every PR | **★ Always** |
+| **Component tests** | Service behavior with a database, queue, or cache | Every PR or affected paths | **★ Usually** |
+| Contract tests | Producer/consumer compatibility | PR and package publication | Conditional — services with external consumers |
+| Integration tests | Deployed components and managed-service integration | Staging or preview | Conditional — stage-gated |
+| Smoke tests | Critical endpoint availability | Every deployment | Conditional — stage-gated |
+| Synthetic journeys | User-visible and business behavior | After rollout and continuously | Conditional — post-deploy |
+| Performance/resilience | Capacity, latency, timeout, and degradation behavior | Scheduled or before risky releases | Conditional — scheduled |
+
+The `lint` and `unit` jobs in the short version above are exactly two of the three starred layers — the minimum default portfolio every PR runs regardless of architecture.
 
 > **Key insight**: Promote only when the next environment will add new evidence. Repeating identical unit tests in five stages is not defense in depth.
 
 ---
 
-## 2. Define Gates by Stage
+## 2. Each Delivery Stage Must Add Evidence the Last One Could Not
+
+Every stage below should test something the previous one could not — new infrastructure, new data, or new traffic — not repeat what already passed.
 
 ### Pull request
 
@@ -54,7 +101,7 @@ No single test suite proves release safety. Each layer finds a different class o
 - repeat tests that protect artifact integrity;
 - build the immutable binary or image;
 - scan the produced artifact;
-- generate an SBOM and provenance;
+- generate an **SBOM** — a Software Bill of Materials, a manifest listing every package and version compiled into the artifact — and **provenance** — signed, attestable metadata recording who built the artifact, from what source commit, and with which pipeline, so a consumer can verify origin instead of trusting a label;
 - publish only after all build jobs pass.
 
 ### Staging
@@ -74,27 +121,36 @@ No single test suite proves release safety. Each layer finds a different class o
 
 ---
 
-## 3. Make One Stable Required Check
+## 3. Harden the Required Check So a Skipped Job Cannot Pass It
 
-Large workflows often have optional or matrix jobs. Protect the branch with a final gate whose name is stable:
+> **Core:** branch protection can require exactly one job by name; everything below is about making that one job trustworthy once the graph behind it stops being two simple jobs.
+
+The baseline aggregator in the short version has a blind spot. If `lint` fails, GitHub skips `required-ci` outright — its `needs` dependency didn't succeed, so it never runs. The PR still can't merge (a skipped required check does not satisfy the ruleset), but `required-ci` produces no logs and no explicit reason; engineers just see a blocked merge box. Real workflows make this worse with jobs that are legitimately optional, and with **matrix jobs** — one job definition that runs once per entry in a list of inputs, each producing its own check name such as `test (3.11)` and `test (3.12)` — whose names and count change release to release, so pointing branch protection at all of them breaks on the next dependency bump.
+
+> **Production:** the change below is what you need before pointing this at a real workflow with optional or matrix-shaped jobs; skip it while you're still learning the baseline mechanism.
+
+Two changes fix the blind spot: add `if: always()` so `required-ci` always runs and can inspect *why* its inputs failed, and read every upstream job's `result` explicitly instead of trusting the run to fail loudly on its own.
 
 ```yaml
+name: ci
+on: pull_request
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - run: ./scripts/lint.sh
+      - run: echo "lint: 0 issues"
 
   unit:
     runs-on: ubuntu-latest
     steps:
-      - run: ./scripts/unit.sh
+      - run: echo "unit: 42 passed"
 
   integration:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-integration') }}
     runs-on: ubuntu-latest
     steps:
-      - run: ./scripts/integration.sh
+      - run: echo "integration: 12 passed"
 
   required-ci:
     name: required-ci
@@ -114,20 +170,31 @@ jobs:
             test "$result" = "success"
           done
 
-          # This job is intentionally optional, so skipped is acceptable.
+          # integration is the only job allowed to be skipped — its own
+          # `if:` condition, not this aggregator, decides whether that's OK
           case "$INTEGRATION_RESULT" in
             success|skipped) ;;
             *) exit 1 ;;
           esac
 ```
 
-Configure the ruleset to require `required-ci`, not every dynamic matrix child.
+Configure the ruleset to require `required-ci`, not `lint`, `unit`, `integration`, or any matrix child individually.
 
-⚠️ The decision about whether a skipped job is acceptable belongs in reviewed code. Do not silently treat every `skipped` result as success.
+Here's why the `case` statement is written this narrowly rather than accepting `skipped` for anything. Suppose someone later refactors `integration`'s `if:` condition and introduces a typo — the label match now always evaluates false. `integration` reports `needs.integration.result == "skipped"` on every PR, including ones that never asked to skip it, and nothing looks wrong because `skipped` is already an accepted value for that one job. If the same statement had instead treated `skipped` as acceptable for `unit` too — a plausible copy-paste — a similar typo in `unit`'s own condition would silently remove real test execution from every PR while `required-ci` still printed success and GitHub merged the change untested.
+
+⚠️ The decision about whether a skipped job is acceptable belongs in reviewed code, scoped to the one job that is genuinely optional. Do not silently treat every `skipped` result as success.
+
+Not every job earns a place in `needs: [...]`. Add one only once it has an owner, a defined failure disposition — what happens when it goes red — and enough run history to trust its signal; an unreliable scanner or a brand-new smoke test blocks merges on noise instead of risk. Until those three are true, run it as an informational check or on a schedule, and promote it into the aggregator once it has earned blocking status.
+
+Test this on a real pull request before trusting it elsewhere:
+
+- **Passing case**: once `lint`, `unit`, and (if triggered) `integration` finish, the merge box lists `required-ci` with a green check and "All checks have passed" — that exact name, not the jobs behind it, is what the ruleset evaluates.
+- **Failing case**: force `unit` to fail. `required-ci` still runs — `if: always()` guarantees it — evaluates `UNIT_RESULT=failure`, exits non-zero, and the merge box shows `required-ci` red with merging blocked.
+- **Silent-failure tell**: if the ruleset's required-check name doesn't exactly match — the ruleset says `required-ci` but a rename left the job's `name:` field as `Required CI`, or the workflow's `on:` no longer triggers on the PR's base branch — the merge box shows `required-ci` pending indefinitely, labeled something like "Expected — waiting for status to be reported." GitHub is waiting for a status that will never arrive; that symptom means the name or trigger has drifted, not that the pipeline is slow.
 
 ---
 
-## 4. Test Changed Scope without Creating Blind Spots
+## 4. Directory Filters Miss Consumers Whose Own Path Did Not Change
 
 Monorepos benefit from change detection:
 
@@ -139,13 +206,15 @@ changed paths
 └── infra/** ───────────────> affected infrastructure plans
 ```
 
-Prefer an explicit dependency map over simple directory filters. A shared package change may require tests in consumers whose paths did not change.
+Prefer an explicit dependency map over simple directory filters.
+
+> **Edge case:** a shared library bump only trips its own directory filter. Without a dependency map, every consumer that imports it skips testing entirely until the break shows up in staging.
 
 Use a detection job to emit service outputs, run conditional jobs, then let the stable final gate validate the outcomes. Keep a scheduled full build to catch mistakes in the dependency map.
 
 ---
 
-## 5. Treat Flaky Tests as Defects
+## 5. A Flaky Test Is a Defect, Not Noise to Rerun Away
 
 Automatic reruns can distinguish environmental noise from a persistent failure, but they can also hide regression probability.
 
@@ -172,7 +241,7 @@ A flake policy should define:
 
 ---
 
-## 6. Test the Delivery Mechanism
+## 6. The Pipeline Is Code Too, and Its Own Changes Need Review
 
 Pipeline code changes production. Test it accordingly:
 
@@ -186,11 +255,15 @@ Pipeline code changes production. Test it accordingly:
 | Rollback workflow | Game day or scheduled non-production recovery |
 | OIDC policy | Positive and negative assumption tests |
 
-Changes to workflow permissions, OIDC trust, and runner selection deserve code-owner review even when application tests are unchanged.
+A workflow that deploys to cloud infrastructure typically assumes a cloud role through **OIDC** — OpenID Connect, a protocol where GitHub issues the running workflow a short-lived signed token carrying claims such as `repo:org/repo:ref:refs/heads/main`, and the cloud provider's trust policy checks those claims before handing back temporary credentials. "Positive and negative assumption tests" means exactly that exchange, tested both ways: a run from an allowed branch should receive credentials, and a run from a fork or a disallowed ref should be refused.
+
+Suppose a contributor edits the deployment workflow to add `permissions: id-token: write` where it wasn't needed before, or widens that trust condition so any branch — not only `main` — can assume the deploy role. The next PR opened from that branch now receives real production credentials through the OIDC exchange above. Or, instead, they change `runs-on` to a self-hosted runner label they control, and their workflow executes on hardware with whatever network access and cached credentials that runner already has. Neither change touches application code, so application tests catch nothing.
+
+Changes to workflow permissions, OIDC trust, and runner selection deserve code-owner review even when application tests are unchanged — independent review, by someone other than the change's author, is what stops a contributor from approving their own privilege escalation.
 
 ---
 
-## 7. Manage Test Data and Environments
+## 7. Cleanup Must Refuse a Bad Identifier Before It Deletes Anything
 
 Production-like evidence does not require copying unrestricted production data.
 
@@ -209,11 +282,46 @@ Production-like evidence does not require copying unrestricted production data.
   run: ./scripts/delete-preview.sh "$PREVIEW_ID"
 ```
 
-The cleanup script must validate the identifier and refuse broad or empty targets.
+The step above is only as safe as the script it calls. An empty `$PREVIEW_ID` — a workflow re-run outside a pull-request context, say — must not resolve to "delete everything":
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+id="${1:-}"
+
+# An empty or malformed value here would otherwise expand into deleting
+# every namespace matched by a bare `kubectl delete namespace`.
+if [[ ! "$id" =~ ^pr-[0-9]+$ ]]; then
+  echo "refusing to delete: '$id' is not a valid pr-<number> namespace" >&2
+  exit 1
+fi
+
+echo "resolved namespace: $id"
+echo "before delete:"
+kubectl get ns -l app=preview -o name
+
+kubectl delete namespace "$id" --ignore-not-found
+echo "after delete:"
+kubectl get ns -l app=preview -o name
+```
+
+Run it for PR #482 while an unrelated PR #501 preview is still open, and the observation looks like this:
+
+```text
+resolved namespace: pr-482
+before delete:
+namespace/pr-482
+namespace/pr-501
+after delete:
+namespace/pr-501
+```
+
+`pr-482` is gone; `pr-501` — a namespace the script never touched — is still there. If every `pr-*` namespace disappears instead, or the script exits `0` on an empty identifier, the guard on the input is missing or wrong.
 
 ---
 
-## 8. Common Failure Modes
+## 8. Gate Quality Decays Without Deliberate Maintenance
 
 **More tests make feedback slower but not safer**
 
@@ -221,7 +329,7 @@ Classify tests by defect type. Delete duplicates, move expensive suites later, a
 
 **Security scans are informative but not gating**
 
-Define severity, exploitability, age, and exception policies. A scanner with no disposition process becomes noise.
+Define severity, exploitability, age, and exception policies. A scanner with no disposition process becomes noise — the same boundary from [section 3](#3-harden-the-required-check-so-a-skipped-job-cannot-pass-it): it stays advisory until ownership and disposition exist.
 
 **The test environment is permanently shared**
 

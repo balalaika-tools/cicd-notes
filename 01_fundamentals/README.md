@@ -19,7 +19,11 @@
 ## Reading Order
 
 1. **Production delivery flow** — begin with the system and feedback loops
+
+   **Milestone**: you can now explain the path from a proposed change to a verified release. Continue when you need to decide *which* changes are allowed to enter that path.
 2. **Branching and change control** — control which changes may enter the system
+
+   **Milestone**: you can now choose a branching model and the reviewer/ownership rules around it. **Stop here** if that's all your team needs today; continue when you need to define what evidence each merge gate must see before it lets a change through.
 3. **Testing and quality gates** — define the evidence each change must produce
 
 ---

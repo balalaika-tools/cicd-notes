@@ -24,8 +24,14 @@
 
 1. **Workflow building blocks** — learn the execution and data model
 2. **Pull-request CI** — apply the model to safe validation
+
+   **Stop here** if a required, secure PR check is all you need. Continue when you need to publish a deployable, immutable artifact.
 3. **Build, publish, and promote** — produce deployable release candidates
+
+   **Stop here** if you now have a digest-addressed artifact you can promote by hand. Continue when more than one repository needs to share this build/publish logic.
 4. **Reusable workflows and actions** — standardize repeated logic
+
+   **Stop here** if one repository owns the shared logic others call. Continue when your pipeline must trigger, wait on, or react to work in *other* repositories.
 5. **Cross-repository orchestration** — coordinate independent repositories
 6. **Performance and reliability** — tune the resulting system
 

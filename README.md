@@ -45,8 +45,9 @@ cicd-notes/
 │
 │ ── PRODUCTION REFERENCE ──────────────────────────────────────
 └── 05_reference/
-    ├── 01_end_to_end_production_example.md  Docker service deployed to AWS ECS
-    └── 02_production_readiness_checklist.md Review and adoption checklist
+    ├── 01_provisioning_the_reference_platform.md Terraform for ECR, ECS, and IAM roles
+    ├── 02_end_to_end_production_example.md  Docker service deployed to AWS ECS
+    └── 03_production_readiness_checklist.md Review and adoption checklist
 ```
 
 ---
@@ -79,6 +80,7 @@ cicd-notes/
 | [Permissions, secrets, and OIDC](03_security_and_supply_chain/01_permissions_secrets_and_oidc.md) | Token boundaries, GitHub Apps, cloud federation, and trust policies |
 | [Workflow and runner hardening](03_security_and_supply_chain/02_workflow_and_runner_hardening.md) | SHA pinning, injection prevention, fork safety, and ephemeral runners |
 | [SBOM, provenance, and attestations](03_security_and_supply_chain/03_sbom_provenance_and_attestations.md) | Producing and verifying supply-chain evidence |
+| [Dependency update governance](03_security_and_supply_chain/04_dependency_update_governance.md) | Review tiering, required CI, CVE escalation, and staleness tracking for pin updates |
 
 ### Delivery Operations — [full index](04_delivery_operations/README.md)
 
@@ -88,13 +90,15 @@ cicd-notes/
 | [Deployment strategies](04_delivery_operations/02_deployment_strategies.md) | Selecting rolling, blue-green, canary, and feature-flag techniques |
 | [Infrastructure and database changes](04_delivery_operations/03_infrastructure_and_database_changes.md) | Terraform controls and expand-contract migrations |
 | [Verification, observability, and rollback](04_delivery_operations/04_verification_observability_and_rollback.md) | Health gates, deployment telemetry, rollback, and DORA signals |
+| [Configuration versioning and recovery](04_delivery_operations/05_configuration_versioning_and_recovery.md) | Versioning, validating, and restoring config and feature-flag state alongside a digest |
 
 ### Production Reference — [full index](05_reference/README.md)
 
 | Guide | Description |
 |-------|-------------|
-| [End-to-end production example](05_reference/01_end_to_end_production_example.md) | A cohesive Python, Docker, ECR, and ECS delivery design |
-| [Production-readiness checklist](05_reference/02_production_readiness_checklist.md) | A concise review checklist and maturity ladder |
+| [Provisioning the reference platform](05_reference/01_provisioning_the_reference_platform.md) | Terraform for the ECR repository, ECS clusters/services, and IAM deployment roles the example below assumes |
+| [End-to-end production example](05_reference/02_end_to_end_production_example.md) | A cohesive Python, Docker, ECR, and ECS delivery design |
+| [Production-readiness checklist](05_reference/03_production_readiness_checklist.md) | A concise review checklist and maturity ladder |
 
 ---
 
@@ -108,21 +112,27 @@ cicd-notes/
 1. [Production delivery flow](01_fundamentals/01_production_delivery_flow.md) — establish the delivery mental model
 2. [Workflow building blocks](02_github_actions/01_workflow_building_blocks.md) — learn how GitHub Actions expresses that model
 3. [Pull-request CI](02_github_actions/02_pull_request_ci.md) — implement the first practical gate
-4. [Environments and promotions](04_delivery_operations/01_environments_and_promotions.md) — extend CI into controlled delivery
+
+   **Stop here** if a merge gate is all you need right now. Continue only once you need to publish a deployable artifact and move it between environments.
+4. [Build, publish, and promote](02_github_actions/03_build_publish_and_promote.md) — turn a passing PR into one immutable, digest-addressed release candidate
+5. [Environments and promotions](04_delivery_operations/01_environments_and_promotions.md) — promote that digest through staging and production without rebuilding it
+
+   Required production-identity continuation: read [Permissions, secrets, and OIDC](03_security_and_supply_chain/01_permissions_secrets_and_oidc.md) before this promotion touches real production credentials — the deployment role and trust policy it describes are inputs this step assumes.
 
 ### Build a Production Pipeline
 
 1. [Testing and quality gates](01_fundamentals/03_testing_and_quality_gates.md) — define evidence before writing YAML
 2. [Build, publish, and promote](02_github_actions/03_build_publish_and_promote.md) — create one immutable release candidate
 3. [Permissions, secrets, and OIDC](03_security_and_supply_chain/01_permissions_secrets_and_oidc.md) — secure deployment identity
-4. [End-to-end production example](05_reference/01_end_to_end_production_example.md) — assemble the complete design
+4. [Provisioning the reference platform](05_reference/01_provisioning_the_reference_platform.md) — create the ECR repository, ECS clusters/services, and IAM roles the design assumes
+5. [End-to-end production example](05_reference/02_end_to_end_production_example.md) — assemble the complete design
 
 ### Standardize Multiple Repositories
 
 1. [Reusable workflows and actions](02_github_actions/04_reusable_workflows_and_actions.md) — centralize implementation safely
 2. [Cross-repository orchestration](02_github_actions/05_cross_repository_orchestration.md) — select the correct coordination pattern
 3. [Workflow and runner hardening](03_security_and_supply_chain/02_workflow_and_runner_hardening.md) — protect the larger trust boundary
-4. [Production-readiness checklist](05_reference/02_production_readiness_checklist.md) — audit adoption consistently
+4. [Production-readiness checklist](05_reference/03_production_readiness_checklist.md) — audit adoption consistently
 
 ### Improve an Existing Pipeline
 

@@ -2,11 +2,53 @@
 
 > **Who this is for**: Teams implementing fast, secure, and enforceable pull-request checks. Read [Workflow Building Blocks](01_workflow_building_blocks.md) first.
 
+## The short version
+
+Five differently named checks on a pull request give a **ruleset** — the policy object that names the single status check a merge requires — nothing stable to point at, and give a **merge queue** — GitHub's temporary environment where several merge candidates are re-validated together right before landing — no single verdict to wait on. The fix is structural: run independent validation jobs in parallel, then let one aggregator job report the only name anything downstream depends on. Three pieces are enough to prove the pattern end to end: a trigger, at least one validation job, and an aggregator that turns any non-success result into a loud failure.
+
+**What you need (3 things):**
+1. A `pull_request` trigger scoped to the branch you protect.
+2. One or more independent validation jobs (lint, test, and so on).
+3. An aggregator job that `needs` every validation job and fails if any of them did not succeed.
+
+**The code:**
+
+```yaml
+name: PR Check
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "lint ok"
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "test ok"
+  required-ci:
+    name: required-ci
+    if: ${{ always() }}
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          test "${{ needs.lint.result }}" = "success"
+          test "${{ needs.test.result }}" = "success"
+```
+**Success signal:** the pull request shows one green `required-ci` check, and that is the only check the branch ruleset needs to require. **Silent-skip tell:** if `lint` or `test` never runs at all — a path filter excluded the change, or the workflow file has a syntax error — GitHub skips them, and without `if: always()` the aggregator would silently skip too, posting no result rather than a failure. The explicit `test "$RESULT" = "success"` lines are what turn that silent skip into a visible red check instead of a merge nobody actually blocked.
+**Not handled yet:** locked and hashed dependencies, timeouts, and real container validation in the [full hardened workflow](#1-one-required-check-survives-any-number-of-jobs); [ordering jobs for fast failure](#2-parallel-jobs-are-fastest-serial-jobs-waste-less-compute); [fork PR isolation](#3-fork-prs-never-get-secrets-or-privileged-runners); the [`pull_request_target` privilege trap](#4-pull_request_target-runs-with-the-target-repositorys-privileges); [security-scanning evidence](#5-name-what-each-security-check-actually-catches); [keeping the check name stable under a matrix](#6-the-required-check-name-is-a-contract-not-a-label); and [what PR artifacts may hold](#7-pr-artifacts-are-evidence-not-a-release-candidate).
+
 ---
 
-## 1. A Production-Oriented Python Workflow
+## 1. One Required Check Survives Any Number of Jobs
 
-This example keeps the default token read-only, supports merge queues, cancels stale PR runs, uses locked dependencies, validates an image, and exposes one stable ruleset check.
+> **Core:** the baseline above is the whole contract — independent jobs feeding one aggregator. Everything below hardens those same three pieces; none of it adds a new one.
+
+This version of that same shape keeps the default token read-only, supports merge queues, cancels stale PR runs, uses locked dependencies, validates an image, and still exposes exactly one stable check.
 
 ```yaml
 name: Required CI
@@ -145,11 +187,13 @@ jobs:
           test "$CONTAINER_RESULT" = "success"
 ```
 
+> **Production:** every difference from the baseline fixes one failure mode: `--require-hashes` stops a floating dependency from changing behavior between runs (see [§8](#8-a-green-check-can-still-hide-a-bad-merge)); `timeout-minutes` stops one hung step from blocking the whole queue; and the container job actually starts the image and polls `/health/ready` instead of trusting a successful `docker build`.
+
 Configure `required-ci` as the ruleset's required status check.
 
 ---
 
-## 2. Order Checks for Fast Failure
+## 2. Parallel Jobs Are Fastest, Serial Jobs Waste Less Compute
 
 GitHub jobs normally start in parallel, which minimizes wall-clock time but may spend compute on a build after lint has already failed.
 
@@ -174,7 +218,7 @@ For most teams, cheap independent checks in parallel followed by expensive integ
 
 ---
 
-## 3. Handle Forked Pull Requests Safely
+## 3. Fork PRs Never Get Secrets or Privileged Runners
 
 Code from a fork is untrusted. The normal `pull_request` event is designed for validation with restricted access.
 
@@ -192,11 +236,11 @@ permissions:
 - Do not publish fork-built artifacts as trusted releases.
 - Treat caches and uploaded artifacts from low-trust runs as untrusted.
 
-If a PR needs a preview environment, use a reviewed approval boundary or a separate privileged workflow that consumes a narrowly validated artifact and does not execute scripts from it.
+> **Edge case:** if a PR needs a live preview environment, use a reviewed approval gate or a separate privileged workflow that consumes a narrowly validated artifact and never executes scripts from it — most PR checks never need this.
 
 ---
 
-## 4. Avoid the `pull_request_target` Trap
+## 4. `pull_request_target` Runs With the Target Repository's Privileges
 
 `pull_request_target` is useful for labeling, commenting, or assigning reviewers because the workflow comes from the target branch and can have target-repository privileges.
 
@@ -227,7 +271,7 @@ jobs:
 
 ---
 
-## 5. Add Security and Policy Evidence
+## 5. Name What Each Security Check Actually Catches
 
 Typical PR checks include:
 
@@ -235,8 +279,8 @@ Typical PR checks include:
 |-------|------------------|
 | Secret scanning | Credentials committed to source |
 | Dependency review | New vulnerable or policy-prohibited dependencies |
-| SAST | Unsafe source patterns and data flows |
-| IaC scanning | Public exposure, weak encryption, broad IAM |
+| **SAST** (static application security testing) | Scans your own source code for unsafe patterns and data flows |
+| **IaC scanning** (infrastructure as code) | Scans Terraform/CloudFormation/Kubernetes manifests for public exposure, weak encryption, or overly broad IAM |
 | Container build | Invalid Dockerfile and missing runtime assets |
 | Container scan | Known issues in OS and language packages |
 | License policy | Incompatible dependency licenses |
@@ -246,7 +290,7 @@ Define a disposition policy. For example: block reachable critical/high findings
 
 ---
 
-## 6. Keep Required Check Names Stable
+## 6. The Required-Check Name Is a Contract, Not a Label
 
 These can accidentally break a ruleset:
 
@@ -258,9 +302,11 @@ These can accidentally break a ruleset:
 
 Use the aggregator pattern and treat its name as a public API. Change it by temporarily requiring both old and new gates, validating the transition, and then removing the old one.
 
+> **Key insight**: the required-check name is an external policy contract — the ruleset stores that string, not the workflow's job graph — so any workflow with a variable job set (a matrix, conditional jobs, path filters) must roll that variability up into one aggregator job with a fixed name instead of exposing it directly.
+
 ---
 
-## 7. Pull-Request Artifact Rules
+## 7. PR Artifacts Are Evidence, Not a Release Candidate
 
 PR artifacts are evidence, not production releases:
 
@@ -281,7 +327,7 @@ Retain failure diagnostics long enough for investigation, but avoid uploading se
 
 ---
 
-## 8. Common Failure Modes
+## 8. A Green Check Can Still Hide a Bad Merge
 
 **CI installs floating dependencies**
 
@@ -301,7 +347,7 @@ Reduce latency, stabilize false failures, and restrict bypass. A control that op
 
 ---
 
-## 9. References
+## 9. Where These Rules Come From
 
 - [Events that trigger workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)
 - [Securely using `pull_request_target`](https://docs.github.com/en/actions/reference/security/secure-use)

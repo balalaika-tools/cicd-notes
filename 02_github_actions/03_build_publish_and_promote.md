@@ -1,10 +1,54 @@
 # Build, Publish, and Promote
 
-> **Who this is for**: Teams turning an accepted commit into an immutable release candidate. Read [Production Pull-Request CI](02_pull_request_ci.md) first.
+> **Who this is for**: Teams turning an accepted commit into an immutable release candidate.
+
+## The short version
+
+A rebuild between staging and production can silently ship different bytes than the ones that were tested — a moved base-image tag, a re-resolved dependency, or a different compiler patch, even from identical source. The fix is to build the release artifact exactly once, publish it under a content digest, and promote that digest — never rebuild it — into every later environment. A digest is sufficient identity because it is a hash of the image's actual bytes: two builds share a digest only if every byte matches.
+
+**What you need (3 things):**
+
+1. A build job that publishes an image to a registry and exposes its digest as a job output.
+2. A digest-qualified reference (`image@sha256:...`), never a moving tag, passed between jobs.
+3. A deploy step that accepts that image and digest and applies them without rebuilding.
+
+**The code:**
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ghcr.io/acme/orders:git-${{ github.sha }}
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "deploy ghcr.io/acme/orders@${{ needs.build.outputs.digest }}"
+```
+
+For this run, `steps.build.outputs.digest` resolves to `sha256:4ae0...9c1d`. The `deploy` job's log line reads `deploy ghcr.io/acme/orders@sha256:4ae0...9c1d` — the digest, not the tag `git-8f31c2a7d9`, is what actually reaches the environment.
+
+**Success signal:** the `deploy` job's log shows `deploy ghcr.io/acme/orders@sha256:4ae0...9c1d` — the same digest string the `build` job produced.
+
+**Not handled yet:** [deterministic build inputs](#3-unpinned-build-inputs-make-two-identical-builds-different), [artifact vs. cache lifetime](#4-a-cache-hit-is-not-a-production-artifact), [promotion mechanics and GitOps](#5-promotion-moves-metadata-never-rebuilds-bytes), and [verifying attestations before trusting a promoted digest](#7-what-promotion-gets-wrong-in-production).
 
 ---
 
-## 1. Use the Digest as Release Identity
+[Production Pull-Request CI](02_pull_request_ci.md) covers getting a commit onto `main` in the first place. Optional background — not required to run the baseline above.
+
+## 1. A Digest Is the Only Identity That Does Not Move
+
+A deploy that reads `orders:latest` can pull a different image than the one your team just reviewed — the tag moved the moment someone else pushed. A rebuild that runs `docker build` again for "the same" release can also produce different bytes than what passed CI, even from identical source, if a base image or dependency resolved differently in between. Both failures share one cause: the identifier the deploy used was never tied to specific content.
 
 ```text
 commit SHA       identifies source
@@ -14,17 +58,21 @@ attestation      links content to build identity and process
 SBOM             describes included components
 ```
 
-An image tag such as `git-8f31c2a` is useful but may be overwritten unless the registry enforces immutability. A digest such as `sha256:4ae0...9c1d` is content-addressed.
+An image tag such as `git-8f31c2a` is useful but may be overwritten unless the registry enforces immutability. A digest such as `sha256:4ae0...9c1d` is content-addressed: it is a hash of the actual bytes, so it changes if and only if the content does.
+
+An **attestation** is a signed claim binding a digest to the workflow run that produced it — evidence of build identity and process, not of code quality. Its **SBOM** (software bill of materials) is the itemized list of packages and versions the image contains. **Provenance** is the build-origin evidence those two records combine to give a verifier: which source, workflow, and runner actually produced this digest. Promotion in this note always means moving a digest plus these records forward, never re-running the build.
 
 > **Rule**: Promotion inputs should contain a digest or an equivalently immutable artifact identifier.
 
 ---
 
-## 2. Build and Publish Once
+## 2. Build the Image Once, Promote the Same Digest Everywhere
+
+> **Core:** the entire baseline is build once, capture the digest as a job output, then pass `image@digest` — never a tag — into every later job. Everything else in this section is what makes that safe to publish.
 
 The following shape publishes an image to GitHub Container Registry and exposes its digest to later jobs.
 
-> The Docker and attestation actions use readable major tags below so the flow remains understandable. Resolve each tag to a reviewed full commit SHA before adopting the workflow; full-SHA pinning is covered in [Workflow and Runner Hardening](../03_security_and_supply_chain/02_workflow_and_runner_hardening.md).
+> **Production:** the Docker and attestation actions use readable major tags below so the flow stays understandable while you learn it. Resolve each tag to a reviewed full commit SHA before adopting the workflow; full-SHA pinning is covered in [Workflow and Runner Hardening](../03_security_and_supply_chain/02_workflow_and_runner_hardening.md).
 
 ```yaml
 name: Build Release Candidate
@@ -53,6 +101,7 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+      artifact-metadata: write
     outputs:
       image: ${{ steps.image.outputs.name }}
       digest: ${{ steps.build.outputs.digest }}
@@ -100,24 +149,49 @@ jobs:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+          # push-to-registry additionally creates a storage record by default;
+          # that write needs artifact-metadata: write above, or pass
+          # create-storage-record: false to opt out instead.
 
   deploy-staging:
     needs: build
-    uses: ./.github/workflows/reusable-deploy.yml
+    runs-on: ubuntu-latest
+    environment: staging
     permissions:
       contents: read
       id-token: write
-    with:
-      environment: staging
-      image: ${{ needs.build.outputs.image }}
-      digest: ${{ needs.build.outputs.digest }}
+    steps:
+      - name: Deploy image@digest to staging
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "Deploying ${IMAGE}@${DIGEST} to staging"
+          # Replace with your platform's deploy call (kubectl set image, aws ecs
+          # update-service, etc.) — the input contract is image + digest, never
+          # a tag. A deploy job shared across many services belongs in a
+          # reusable workflow rather than being copied per repository; see
+          # Reusable Workflows and Actions for that contract's permission
+          # ceiling and SHA-pinning rules.
 ```
 
-The deploy job receives `image@digest`, never a mutable environment tag.
+`push-to-registry: true` above creates a storage record in the registry by default, which needs the `artifact-metadata: write` permission granted in `build`'s `permissions:` block — without it, the step fails once that default applies. If you don't want that record, pass `create-storage-record: false` instead of adding the permission. See [actions/attest usage](https://github.com/actions/attest#usage) and [Using artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) (checked 2026-08-14).
+
+The deploy job receives `image@digest`, never a mutable environment tag. Its `run:` step above is a stand-in for the platform-specific deploy call; extracting it into a shared, versioned reusable workflow — with its own permission ceiling and input contract — is the subject of [Reusable Workflows and Actions](04_reusable_workflows_and_actions.md).
+
+For this run, `steps.build.outputs.digest` resolves to `sha256:4ae0...9c1d`, and the `deploy-staging` job logs `Deploying ghcr.io/acme/orders@sha256:4ae0...9c1d to staging`. Verifying the attestation before trusting that digest further confirms this workflow — not some other build — actually produced it:
+
+```text
+$ gh attestation verify oci://ghcr.io/acme/orders@sha256:4ae0...9c1d --owner acme
+Loaded digest sha256:4ae0...9c1d for file://oci://ghcr.io/acme/orders@sha256:4ae0...9c1d
+Loaded 1 attestation from GitHub API
+✓ Verification succeeded!
+```
 
 ---
 
-## 3. Keep Build Inputs Deterministic
+## 3. Unpinned Build Inputs Make Two Identical Builds Different
 
 Capture or constrain every input that can change output:
 
@@ -145,13 +219,13 @@ USER 10001:10001
 CMD ["python", "-m", "src.api"]
 ```
 
-The digest in this teaching example must be replaced with one verified for the selected base. Automate digest update PRs so stable inputs do not become stale inputs.
+The digest in this teaching example must be replaced with one verified for the selected base. Automate digest update PRs so stable inputs do not become stale inputs — see [Dependency Update Governance](../03_security_and_supply_chain/04_dependency_update_governance.md) for how those PRs get reviewed, gated, and escalated once they open.
 
 Bit-for-bit reproducibility is valuable but not always immediately achievable. At minimum, record inputs well enough to explain and rebuild the release under controlled conditions.
 
 ---
 
-## 4. Separate Artifacts from Caches
+## 4. A Cache Hit Is Not a Production Artifact
 
 | Storage | Use | Production identity? |
 |---------|-----|----------------------|
@@ -165,7 +239,7 @@ A cache hit must never change whether a build is correct. A deleted workflow run
 
 ---
 
-## 5. Promote Metadata, Not Bytes
+## 5. Promotion Moves Metadata, Never Rebuilds Bytes
 
 Promotion updates desired state:
 
@@ -187,15 +261,17 @@ Common implementations:
 | Model | Promotion action |
 |-------|------------------|
 | Direct deployment | Deployment workflow updates the platform to `image@digest` |
-| GitOps | A PR changes an environment manifest to the new digest |
+| **GitOps** — changing version-controlled desired state and letting a reconciler apply that reviewed change | A PR changes an environment manifest to the new digest |
 | Release manifest | A signed manifest maps version and environment to digests |
 | Registry promotion | Copy or retag by digest while preserving content identity |
 
-If a registry copy changes the manifest digest—for example, due to media-type conversion—verify the resulting content and create new provenance for the transformed artifact.
+> **Key insight**: promotion changes trusted metadata that points at immutable bytes; it does not rebuild those bytes. Every row in the table above is really just a different way to update that pointer safely.
+
+> **Edge case:** if a registry copy changes the manifest digest — for example, due to media-type conversion — verify the resulting content and create new provenance for the transformed artifact.
 
 ---
 
-## 6. Record Release Metadata
+## 6. A Deploy Log Is Not Enough for Incident Response
 
 At minimum, retain:
 
@@ -212,7 +288,7 @@ This metadata supports incident response, vulnerability impact analysis, and rec
 
 ---
 
-## 7. Promotion Failure Modes
+## 7. What Promotion Gets Wrong in Production
 
 **Production rebuilds the source tag**
 
@@ -237,6 +313,7 @@ Attestation creation alone does not protect a consumer. Verify identity, reposit
 - [Workflow artifacts](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflow-artifacts)
 - [Using artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations)
 - [Publishing Docker images](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)
+- [actions/attest usage](https://github.com/actions/attest#usage)
 
 ---
 

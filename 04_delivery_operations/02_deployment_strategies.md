@@ -2,9 +2,48 @@
 
 > **Who this is for**: Engineers choosing how a new version receives production traffic. Read [Environments and Artifact Promotion](01_environments_and_promotions.md) first.
 
+## The short version
+
+Deploy a bad build to every instance at once and every user hits it before anyone notices — there's no window between "code is running" and "everyone is exposed." **Progressive delivery** is the fix: deliberately increase exposure — the fraction of instances or requests routed to the new version — in small steps, and widen exposure only while each step's evidence stays healthy.
+
+**What you need (4 things):**
+
+1. A named candidate version — a container image digest, the immutable content hash that pins exactly which build is running, not a mutable tag.
+2. A traffic mechanism that can move a known, small slice of instances or requests onto that candidate.
+3. Version-segmented health signals: error rate and latency measured separately for candidate vs. baseline, never blended together.
+4. A fixed decision rule: the exact threshold that means "continue," and the exact threshold that means "stop and roll back."
+
+**Worked example:**
+
+```text
+orders service — candidate sha256:4f9c1a...
+
+traffic:  0% ──5%──▶ 25% ──▶ 50% ──▶ 100%
+                 │
+                 └── bake: fixed observation window held after every step
+
+step at 5% weight, after the bake window:
+  requests observed:   1,204
+  error rate:           0.25%   (ceiling 1%)
+  latency:              238ms   (ceiling 400ms)
+  decision:             CONTINUE → widen to 25%
+
+same step, if telemetry is missing instead:
+  requests observed:   0
+  decision:             STOP → hold at 0% (no data is not a healthy signal)
+```
+
+**Success signal:** every metric inside its threshold for the whole bake window means continue to the next step; any threshold breached, or zero candidate requests observed, means stop and return traffic to 0%.
+
+**Not handled yet:** whether the previous version can still read what the candidate already wrote ([state compatibility](#9-rollback-only-works-if-the-previous-version-can-still-read-the-data)), how a traffic percentage is actually enforced at the network layer ([routing](#5-canary-limits-exposure-by-watching-metrics-before-widening-traffic)), how long a flag stays in the codebase after rollout finishes ([flag lifecycle](#6-feature-flags-separate-exposure-from-deployment-not-from-compatibility)), and what a failed rollout needs to restore ([recovery](04_verification_observability_and_rollback.md)).
+
 ---
 
 ## 1. Deployment Is Not Release
+
+A team ships a new binary to every production pod in one rolling restart. Two minutes later, every user in every region is served by the new code — at no point in that rollout did anyone choose who saw the new behavior, only whether the process was up. If the build has a bug, it isn't a few users' problem; it's everyone's, simultaneously, and the only lever left is a fleet-wide emergency rollback.
+
+That happens because two different actions get treated as one:
 
 ```text
 deployment
@@ -13,6 +52,8 @@ deployment
 release
     expose behavior to users
 ```
+
+Conflating them removes a lever. Deploying without releasing lets you get new code running — and verify it's operationally sound — before a single user's request depends on it.
 
 Feature flags allow the two to happen separately:
 
@@ -29,7 +70,15 @@ Flags reduce exposure risk but add state and testing combinations. Every flag ne
 
 ---
 
-## 2. Strategy Comparison
+## 2. Each Strategy Buys Safety by Spending Capacity, Complexity, or Time
+
+Before comparing rows, know what each name refers to:
+
+- **Recreate** — stop every old instance, then start every new one. Simplest possible sequence; there's a window where nothing serves traffic at all.
+- **Rolling** — replace old instances with new ones a few at a time, so old and new versions serve real traffic side by side during the transition.
+- **Blue-green** — bring the new version up fully in a separate, idle environment, then switch all traffic to it in one move, keeping the old environment live as a fast switchback.
+- **Canary** — send a small, growing percentage of real traffic to the new version while the rest keeps hitting the old one, watching metrics before widening exposure further.
+- **Shadow** — send a copy of real requests to the new version without using its response, observing behavior with no effect on what the user sees.
 
 | Strategy | Extra capacity | Traffic control | Rollback speed | Main constraint |
 |----------|----------------|-----------------|----------------|-----------------|
@@ -40,11 +89,11 @@ Flags reduce exposure risk but add state and testing combinations. Every flag ne
 | Feature flag | Application-dependent | User/behavior exposure | Very fast flag change | Two code paths and flag debt |
 | Shadow | High for duplicated processing | No user response from candidate | No user rollback needed | Side effects and data privacy |
 
-The safest choice depends on state compatibility, observability, traffic control, capacity, and consequence—not fashion.
+> **Core:** the safest choice depends on state compatibility, observability, traffic control, capacity, and consequence for the specific change being shipped — not on which strategy is most familiar or currently fashionable.
 
 ---
 
-## 3. Rolling Deployment
+## 3. Rolling Deployments Avoid Downtime by Running Old and New Together
 
 ```text
 time ─────────────────────────────────────────────>
@@ -63,6 +112,8 @@ Use when:
 - capacity supports surge or temporary reduction;
 - readiness checks accurately represent service ability.
 
+> **Production:** the controls below are what keep a rolling deployment from turning a bad build into an outage — required before this ships, not needed to understand the shape above.
+
 Control:
 
 - maximum unavailable capacity;
@@ -73,11 +124,11 @@ Control:
 - platform circuit breaker;
 - backward-compatible schema and protocol.
 
-AWS ECS rolling deployments can use a deployment circuit breaker and CloudWatch alarms to detect failure and automatically roll back to the last completed deployment.
+AWS **ECS** (Elastic Container Service, AWS's managed container orchestrator) rolling deployments can use a **deployment circuit breaker** — a failure detector that watches task health during the rollout, stops the rollout once a failure threshold is crossed, and can automatically restore the last completed deployment — together with CloudWatch alarms that feed it failure signals.
 
 ---
 
-## 4. Blue-Green Deployment
+## 4. Blue-Green Buys Instant Rollback by Duplicating Everything
 
 ```text
                  ┌──────────────┐
@@ -95,6 +146,8 @@ retain blue for bounded rollback window
 
 Use when a traffic switch is available and fast rollback justifies duplicate capacity.
 
+> **Production:** these are the specific ways a "flip traffic back" plan quietly stops being available by the time you need it.
+
 Watch for:
 
 - data writes that make switching back unsafe;
@@ -107,7 +160,7 @@ Blue-green changes compute exposure; it does not duplicate the database automati
 
 ---
 
-## 5. Canary Deployment
+## 5. Canary Limits Exposure by Watching Metrics Before Widening Traffic
 
 ```text
 candidate traffic:
@@ -115,6 +168,8 @@ candidate traffic:
      │     │      │
      └─────┴──────┴── bake + evaluate at each step
 ```
+
+Each arrow holds for a **bake** — the fixed observation window described above, held after every traffic step — before the controller evaluates and either widens exposure or stops.
 
 Choose canary signals before rollout:
 
@@ -124,6 +179,8 @@ Choose canary signals before rollout:
 - dependency errors;
 - business conversions or rejected operations;
 - invariant or data-quality violations.
+
+> **Production:** a canary is only as good as the controller enforcing it — the interface below is what turns the diagram above into an actual gate.
 
 Concrete controller interface:
 
@@ -145,13 +202,34 @@ for weight in 5 25 50 100; do
 done
 ```
 
-Those scripts must query version-segmented metrics, handle low traffic, and stop or roll back when data is missing. “No metrics” is not success.
+The flags encode the decision rule directly: a max error rate, and a max **p95** latency — the value under which 95% of measured requests fall, so a handful of slow outliers don't block promotion the way the true worst case would.
+
+One evaluated window looks like this:
+
+```text
+$ ./scripts/verify-canary-window.sh --service orders --candidate-digest sha256:4f9c1a... \
+    --minutes 10 --max-error-rate 0.01 --max-p95-latency-ms 400
+
+candidate requests observed:  1204
+candidate error rate:         0.0025   (threshold 0.01)
+candidate p95 latency:        238ms    (threshold 400ms)
+decision: PROMOTE  (5% -> 25%)
+```
+
+And the failure mode that isn't a threshold breach at all:
+
+```text
+candidate requests observed:  0
+decision: HALT  (no candidate telemetry in the window — missing data is treated as failure, not as a clean signal)
+```
+
+Those scripts must query version-segmented metrics, handle low traffic, and stop or roll back when data is missing. "No metrics" is not success.
 
 AWS ECS canary deployments support a small initial traffic shift followed by full traffic, bake time, lifecycle hooks, and alarm-driven rollback. Other platforms and progressive-delivery controllers support more steps and cohort strategies.
 
 ---
 
-## 6. Feature Flags
+## 6. Feature Flags Separate Exposure From Deployment, Not From Compatibility
 
 Classify flags:
 
@@ -162,6 +240,8 @@ Classify flags:
 | Experiment | Bounded by experiment | Compare ranking algorithms |
 | Permission flag | Long-lived policy | Enable a tenant capability |
 
+> **Production:** the rules below are what keep a flag from becoming its own outage — an untested combination or stale cached state is exactly as dangerous as a bad deploy.
+
 Operational rules:
 
 - safe default when the flag service is unavailable;
@@ -171,11 +251,13 @@ Operational rules:
 - cache with bounded staleness;
 - remove release flags after full adoption.
 
-Do not use a feature flag to hide an incompatible schema migration.
+A flag controls which code path runs; it has no say over what shape the data underneath is in. Say a migration changes a column's format, and either an old instance that hasn't redeployed yet, or any request routed to a cohort where the flag is still off, reads a row the new code already wrote. The flag never touches that instance's code — it still runs the old parser — and the row is now in a shape that parser cannot read, so the request fails or misreads data regardless of what the flag is set to. Hiding an incompatible schema migration behind a feature flag doesn't make the migration compatible; it just guarantees that some cohort hits the incompatible shape while believing the flag protected them.
 
 ---
 
-## 7. Shadow and Mirrored Traffic
+## 7. Shadow Traffic Tests Candidates With Zero User-Facing Risk
+
+> **Edge case:** reach for shadowing only when you need production-realistic input with zero chance of affecting a real user. Most changes are better served by canary, which does expose users, but under a controlled and reversible slice.
 
 Shadowing sends a copy of production requests to a candidate but ignores its response:
 
@@ -191,7 +273,7 @@ Shadow success does not prove the candidate's response is acceptable to users un
 
 ---
 
-## 8. Match Strategy to Change Risk
+## 8. Match the Strategy to the Change's Risk, Not to Habit
 
 | Change | Default strategy |
 |--------|------------------|
@@ -211,17 +293,23 @@ blue-green infrastructure
     + expand-contract data migration
 ```
 
+**Expand-contract** is a compatibility-preserving sequence for schema change: add the new shape while the old one keeps working, migrate reads and writes over to it, and only remove the old shape once nothing still depends on it — never drop or rewrite a column in place while old and new code might both be running.
+
 Each extra mechanism adds operational complexity. Use the smallest combination that controls the actual failure modes.
 
 ---
 
-## 9. Rollback and Roll-Forward
+## 9. Rollback Only Works if the Previous Version Can Still Read the Data
+
+> **Core:** rollback is the default response to a bad deploy, but only while the previous version is still data-compatible with what's already been written.
 
 Rollback is appropriate when:
 
 - the previous artifact remains data-compatible;
 - the failure is in application code or configuration;
 - rollback is faster and lower risk than a fix.
+
+> **Edge case:** these are the situations where rollback stops being an option and roll-forward becomes the only safe move.
 
 Roll forward when:
 
@@ -230,13 +318,17 @@ Roll forward when:
 - the failure is understood and a narrow fix is ready;
 - the old version has a known critical vulnerability.
 
+> **Production:** none of the above is decidable in the middle of an incident unless this state was already captured before the incident started.
+
 Always retain:
 
 - previous artifact digest and task definition;
-- release manifest and configuration version;
+- release manifest and [configuration version](05_configuration_versioning_and_recovery.md);
 - traffic-routing state;
 - flag state;
 - migration compatibility window.
+
+> **Key insight**: rollout strategy — rolling, blue-green, canary, shadow — only ever limits how many compute instances or users are exposed to a bad version. Whether rollback is actually safe is decided somewhere else entirely: by whether data and protocol compatibility still hold between the previous version and whatever the new one already wrote.
 
 ---
 

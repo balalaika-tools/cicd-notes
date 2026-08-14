@@ -1,6 +1,6 @@
 # CI/CD Production-Readiness Checklist
 
-> **Who this is for**: Engineers reviewing an existing pipeline or planning incremental production hardening. Read the [End-to-End Production Example](01_end_to_end_production_example.md) for context.
+> **Who this is for**: Engineers reviewing an existing pipeline or planning incremental production hardening. Read the [End-to-End Production Example](02_end_to_end_production_example.md) for context.
 
 ---
 
