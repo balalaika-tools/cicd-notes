@@ -28,13 +28,17 @@ cicd-notes/
 │   ├── 03_build_publish_and_promote.md      Build once and promote by digest
 │   ├── 04_reusable_workflows_and_actions.md Central automation contracts
 │   ├── 05_cross_repository_orchestration.md Dispatch, GitOps, and sync patterns
-│   └── 06_performance_and_reliability.md    Matrix, cache, concurrency, cost
+│   ├── 06_performance_and_reliability.md    Matrix, cache, concurrency, cost
+│   ├── 07_external_repository_integrations.md External App/service bindings
+│   └── 08_cross_repository_contract_lifecycle.md Versioned contract lifecycle
 │
 │ ── SECURITY AND SUPPLY CHAIN ─────────────────────────────────
 ├── 03_security_and_supply_chain/
 │   ├── 01_permissions_secrets_and_oidc.md  Short-lived, least-privilege access
 │   ├── 02_workflow_and_runner_hardening.md Untrusted input and runner isolation
-│   └── 03_sbom_provenance_and_attestations.md Verifiable build provenance
+│   ├── 03_sbom_provenance_and_attestations.md Verifiable build provenance
+│   ├── 04_dependency_update_governance.md Pin update governance
+│   └── 05_github_app_provisioning.md App permissions, installation, and keys
 │
 │ ── DELIVERY OPERATIONS ───────────────────────────────────────
 ├── 04_delivery_operations/
@@ -72,6 +76,8 @@ cicd-notes/
 | [Reusable workflows and actions](02_github_actions/04_reusable_workflows_and_actions.md) | Choosing and governing reusable workflows, composite actions, and templates |
 | [Cross-repository orchestration](02_github_actions/05_cross_repository_orchestration.md) | Dispatch APIs, shared workflows, GitOps, dependency updates, and synchronization |
 | [Performance and reliability](02_github_actions/06_performance_and_reliability.md) | Concurrency, matrices, caches, timeouts, reruns, and cost |
+| [External repository integrations](02_github_actions/07_external_repository_integrations.md) | Establish ownership, external bindings, explicit unknowns, and runtime evidence |
+| [Cross-repository contract lifecycle](02_github_actions/08_cross_repository_contract_lifecycle.md) | Publish, consume, test, update, and deprecate shared libraries and schemas |
 
 ### Security and Supply Chain — [full index](03_security_and_supply_chain/README.md)
 
@@ -81,6 +87,7 @@ cicd-notes/
 | [Workflow and runner hardening](03_security_and_supply_chain/02_workflow_and_runner_hardening.md) | SHA pinning, injection prevention, fork safety, and ephemeral runners |
 | [SBOM, provenance, and attestations](03_security_and_supply_chain/03_sbom_provenance_and_attestations.md) | Producing and verifying supply-chain evidence |
 | [Dependency update governance](03_security_and_supply_chain/04_dependency_update_governance.md) | Review tiering, required CI, CVE escalation, and staleness tracking for pin updates |
+| [GitHub App provisioning](03_security_and_supply_chain/05_github_app_provisioning.md) | Registration permissions, installation scope, key rotation, audit identity, and revocation |
 
 ### Delivery Operations — [full index](04_delivery_operations/README.md)
 
@@ -121,22 +128,30 @@ cicd-notes/
 
 ### Build a Production Pipeline
 
-1. [Testing and quality gates](01_fundamentals/03_testing_and_quality_gates.md) — define evidence before writing YAML
-2. [Build, publish, and promote](02_github_actions/03_build_publish_and_promote.md) — create one immutable release candidate
-3. [Permissions, secrets, and OIDC](03_security_and_supply_chain/01_permissions_secrets_and_oidc.md) — secure deployment identity
-4. [Provisioning the reference platform](05_reference/01_provisioning_the_reference_platform.md) — create the ECR repository, ECS clusters/services, and IAM roles the design assumes
-5. [End-to-end production example](05_reference/02_end_to_end_production_example.md) — assemble the complete design
+1. [Branching and change control](01_fundamentals/02_branching_and_change_control.md) — establish ruleset and ownership evidence
+2. [Testing and quality gates](01_fundamentals/03_testing_and_quality_gates.md) — define merge evidence before writing YAML
+3. [Build, publish, and promote](02_github_actions/03_build_publish_and_promote.md) — create one immutable release candidate
+4. [Permissions, secrets, and OIDC](03_security_and_supply_chain/01_permissions_secrets_and_oidc.md) — secure deployment identity
+
+   **Milestone:** stop here if you need a registry-published, attested candidate with short-lived identity. Continue for the AWS-specific network/bootstrap prerequisites and ECS assembly.
+5. [Provisioning the reference platform](05_reference/01_provisioning_the_reference_platform.md) — verify external owners, then create ECR, ECS, and IAM resources
+6. [End-to-end production example](05_reference/02_end_to_end_production_example.md) — assemble the complete design
 
 ### Standardize Multiple Repositories
 
 1. [Reusable workflows and actions](02_github_actions/04_reusable_workflows_and_actions.md) — centralize implementation safely
 2. [Cross-repository orchestration](02_github_actions/05_cross_repository_orchestration.md) — select the correct coordination pattern
-3. [Workflow and runner hardening](03_security_and_supply_chain/02_workflow_and_runner_hardening.md) — protect the larger trust boundary
-4. [Production-readiness checklist](05_reference/03_production_readiness_checklist.md) — audit adoption consistently
+3. [External repository integrations](02_github_actions/07_external_repository_integrations.md) — verify App/service-side access and runtime consumption
+
+   **Milestone:** stop here once the coordination contract and its external access/runtime evidence are verified. Continue for security hardening and adoption audit.
+4. [Workflow and runner hardening](03_security_and_supply_chain/02_workflow_and_runner_hardening.md) — protect the larger trust boundary
+5. [Production-readiness checklist](05_reference/03_production_readiness_checklist.md) — audit adoption consistently
 
 ### Improve an Existing Pipeline
 
 1. [Performance and reliability](02_github_actions/06_performance_and_reliability.md) — reduce latency, waste, and race conditions
+
+   **Milestone:** stop here when the measured queue/critical-path bottleneck is fixed. Continue when rollout risk, artifact trust, or recovery is the next constraint.
 2. [Deployment strategies](04_delivery_operations/02_deployment_strategies.md) — reduce release blast radius
-3. [Verification, observability, and rollback](04_delivery_operations/04_verification_observability_and_rollback.md) — close the operational feedback loop
-4. [SBOM, provenance, and attestations](03_security_and_supply_chain/03_sbom_provenance_and_attestations.md) — make released artifacts verifiable
+3. [SBOM, provenance, and attestations](03_security_and_supply_chain/03_sbom_provenance_and_attestations.md) — make released artifacts verifiable
+4. [Verification, observability, and rollback](04_delivery_operations/04_verification_observability_and_rollback.md) — close the operational feedback loop with signer-aware recovery

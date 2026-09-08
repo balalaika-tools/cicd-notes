@@ -198,7 +198,7 @@ privileged deployment workflow
 
 That deployment job's **OIDC role** — OpenID Connect, a federated-identity protocol that lets the runner exchange a short-lived signed token for cloud credentials instead of a stored secret — is only safe because the code running in it already passed review. Two GitHub event contexts break that separation by handing privileged authority to a job that still runs on unreviewed input: **`pull_request_target`**, which triggers on a fork's pull request but always executes in the base repository's context — with its secrets and write-scoped token — even while checking out the fork's own code; and **`workflow_run`**, which triggers after another workflow finishes and inherits the triggering repository's default token and secrets, even when the workflow it followed ran attacker-supplied PR code.
 
-Walk the first one through: a workflow on `pull_request_target` checks out the PR's own branch to reuse an existing test job — a common shortcut. The checkout pulls attacker-controlled code, but the job still carries the base repository's write-scoped token and secrets, because `pull_request_target` always runs with the target repository's context regardless of whose code it checked out. That code now executes with deployment-adjacent authority: it can exfiltrate secrets over the network, or push using the token.
+Walk the first one through: a workflow on `pull_request_target` explicitly enables `allow-unsafe-pr-checkout: true`, uses custom `git fetch`/`checkout` commands, or otherwise executes files from the PR branch. Current `actions/checkout` releases refuse unsafe fork checkout by default in this context, but overriding or bypassing that guard pulls attacker-controlled code while the job still carries the base repository's authority. That code can exfiltrate secrets or push using the token.
 
 Avoid combining the two through `pull_request_target`.
 
@@ -212,6 +212,44 @@ If a privileged workflow consumes an artifact produced by an untrusted workflow:
 - do not trust a filename or digest supplied only by the producer.
 
 The same hand-off happens through `workflow_run`: a first workflow — correctly scoped read-only, running attacker PR code — uploads an artifact; a second, privileged workflow triggered by `workflow_run` downloads and extracts it, trusting its own producer by default, then runs a script from inside it. The extraction step itself — path traversal into `.github/workflows/`, or executing a checked-in script pulled from the archive — is what hands the attacker the second workflow's token, secrets, or network reach. Neither workflow individually ran untrusted code with elevated permissions; the artifact hand-off is where the authority crosses the boundary. A `workflow_run` consumer can be privileged even when the producing workflow was not — treat the artifact boundary like an external upload.
+
+This minimal consumer binds the named producer and exact commit before treating a one-file JSON archive as data:
+
+```yaml
+on:
+  workflow_run:
+    workflows: ["PR Evidence"]
+    types: [completed]
+jobs:
+  consume:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    permissions: { actions: read, contents: read }
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and validate data-only evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          PRODUCER: ${{ github.event.workflow_run.name }}
+        run: |
+          set -euo pipefail
+          test "$PRODUCER" = "PR Evidence"
+          artifact_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name == "pr-evidence") | .id')"
+          test -n "$artifact_id"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > artifact.zip
+          test "$(zipinfo -1 artifact.zip | wc -l | tr -d ' ')" = 1
+          ! zipinfo -1 artifact.zip | grep -Eq '(^/|(^|/)\.\.(/|$))'
+          test "$(unzip -l artifact.zip | awk 'NR>3 && $1 ~ /^[0-9]+$/ {sum += $1} END {print sum+0}')" -le 1048576
+          mkdir incoming
+          unzip -q artifact.zip -d incoming
+          test -f incoming/result.json
+          test "$(jq -er .head_sha incoming/result.json)" = "$EXPECTED_SHA"
+          jq -e 'keys | sort == ["head_sha","result"] and (.result | type == "string")' incoming/result.json
+```
+
+Accepted evidence reaches the next data-processing step. A wrong producer prevents the job from starting; an archive that extracts extra paths, exceeds 1 MiB, or names another commit fails before any privileged action. Never execute a file from `incoming`.
 
 ---
 
@@ -275,6 +313,19 @@ destroy runner and storage
     ↓
 verify: runner absent from the repo's runner list, instance terminated, volume gone
 ```
+
+The infrastructure owner creates the VM/container; the GitHub organization owner supplies a short-lived registration token and runner-group scope. The bootstrap's load-bearing setting is `--ephemeral`:
+
+```bash
+./config.sh --unattended --ephemeral \
+  --url https://github.com/acme/orders \
+  --token "$ONE_TIME_REGISTRATION_TOKEN" \
+  --name "orders-${INSTANCE_ID}" \
+  --labels orders-deploy
+./run.sh
+```
+
+`--ephemeral` makes GitHub de-register the runner after one assigned job; the infrastructure controller must then terminate the instance and volume. A second queued job receives a newly named runner, never the prior instance.
 
 **How you know it's working:** after the job finishes, `GET /repos/{owner}/{repo}/actions/runners` (or the runner-group listing in the UI) no longer lists that runner's name at all — not marked offline, absent — and the cloud side confirms the backing instance has reached a terminated/deallocated state with its attached volume deleted.
 
@@ -345,6 +396,17 @@ Enforce:
 - read-only default token permissions;
 - audit-log review for workflow, secret, runner, environment, and ruleset changes;
 - separate approval for changes that both expand permission and consume that permission.
+
+Prove externally owned controls instead of inferring them from these files:
+
+| Control | Owner/source of truth | Negative test |
+|---|---|---|
+| Allowed actions and default token | Organization/repository Actions administrator; effective Actions settings API/export | an unapproved action or write attempt is rejected |
+| Runner group scope | Organization runner administrator; runner-group API | a repository outside the allowlist cannot schedule the label |
+| Rulesets and bypass actors | Repository/organization administrator; all active rulesets targeting the branch | non-owner approval or bypass attempt remains blocked |
+| Audit retention/review | Enterprise security owner; audit-log configuration and query | a test settings change appears with actor and timestamp |
+
+Repository-owned workflow and `CODEOWNERS` files prove declared intent only. If the organization or enterprise surface is inaccessible, mark its state `unknown` and do not claim the control is active.
 
 An attacker who can alter the deployment workflow can often alter what gets deployed, even without direct access to cloud credentials.
 

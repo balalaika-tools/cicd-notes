@@ -16,6 +16,7 @@
 | [02_workflow_and_runner_hardening.md](02_workflow_and_runner_hardening.md) | Execution security | Action pinning, injection prevention, fork safety, and runner isolation |
 | [03_sbom_provenance_and_attestations.md](03_sbom_provenance_and_attestations.md) | Supply-chain evidence | SBOMs, provenance attestations, signing, and verification |
 | [04_dependency_update_governance.md](04_dependency_update_governance.md) | Dependency lifecycle | Review tiering, required CI, CVE escalation, and staleness tracking for pin updates |
+| [05_github_app_provisioning.md](05_github_app_provisioning.md) | Automation identity administration | App permissions, installation scope, key rotation, audit, and revocation |
 
 ---
 
@@ -24,9 +25,10 @@
 1. **Permissions, secrets, and OIDC** — limit who the workflow can become
 
    **Milestone**: you can now replace a long-lived stored cloud key with a short-lived, narrowly-trusted federated role. **Stop here** if every workflow that touches this credential runs only your own reviewed code. Continue to runner hardening as soon as untrusted input (fork PRs) or self-hosted execution enters that trust boundary.
-2. **Workflow and runner hardening** — limit what workflow code can do
-3. **SBOM, provenance, and attestations** — make outputs independently verifiable
-4. **Dependency update governance** — keep the SHA, digest, and package pins those first three guides depend on from going stale or landing unreviewed
+2. **GitHub App provisioning** — create and verify a narrowly installed automation identity
+3. **Workflow and runner hardening** — limit what workflow code can do
+4. **SBOM, provenance, and attestations** — make outputs independently verifiable
+5. **Dependency update governance** — keep the SHA, digest, and package pins those guides depend on from going stale or landing unreviewed
 
 ---
 

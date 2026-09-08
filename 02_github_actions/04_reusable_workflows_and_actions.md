@@ -33,7 +33,7 @@ jobs:
 jobs:
   deploy-production:
     permissions: { contents: read }
-    uses: acme/platform-workflows/.github/workflows/greet.yml@main
+    uses: acme/platform-workflows/.github/workflows/greet.yml@0123456789abcdef0123456789abcdef01234567
     with: { service: orders }
 # job log → Deploying orders
 ```
@@ -72,6 +72,20 @@ Avoid turning the reusable workflow into a hidden application. It should coordin
 ---
 
 ## 2. A Reusable Workflow Is a Typed Deployment Contract Between Repositories
+
+Three external controls must already exist, and caller YAML cannot prove them:
+
+| Boundary | Administrative owner and source of truth | Positive proof | Failure tell |
+|---|---|---|---|
+| Central workflow access | `platform-workflows` repository admin; Actions access settings/API | `orders` can resolve the pinned workflow | `workflow was not found` from a repository outside the allowlist |
+| Caller environment | `orders` environment admin; environment settings/API | protected `main` waits for required reviewers, then receives variables | an unprotected ref is refused before credentials are exposed |
+| AWS federation | cloud security owner; live IAM trust policy | approved workflow/ref assumes the role | changed repository, ref, workflow, or environment receives `AccessDenied` |
+
+This trust-policy condition excerpt binds the OpenID Connect token's `aud` (intended recipient) and `sub` (workload identity string); the full policy belongs in [Permissions, Secrets, and OIDC](../03_security_and_supply_chain/01_permissions_secrets_and_oidc.md):
+
+```json
+{"aud":"sts.amazonaws.com","sub":"repo:acme/orders:environment:production"}
+```
 
 The example below deploys to Amazon **ECS** (Elastic Container Service), AWS's managed service for running containerized tasks and services — it's the deployment target the reusable workflow updates. The caller authenticates with **OIDC** (OpenID Connect), a workload-identity protocol that lets the Actions runner exchange a short-lived signed token for temporary AWS credentials instead of a stored long-lived key — it's the credential exchange the first step performs. That exchange assumes an IAM role identified by its **ARN** (Amazon Resource Name), the globally unique string AWS uses to name a resource, such as `arn:aws:iam::123456789012:role/orders-production-deploy` — it's the role identifier the caller passes in as an input.
 
@@ -120,17 +134,38 @@ jobs:
       cancel-in-progress: false
 
     steps:
-      # Resolve this readable major tag to a verified full SHA in production.
+      - name: Resolve a reviewed target mapping
+        id: target
+        env:
+          REQUESTED_ENVIRONMENT: ${{ inputs.environment }}
+          TASK_DEFINITION_ARN: ${{ inputs.task_definition_arn }}
+        run: |
+          set -euo pipefail
+          [[ "$TASK_DEFINITION_ARN" =~ ^arn:aws:ecs:[a-z0-9-]+:[0-9]{12}:task-definition/orders:[0-9]+$ ]]
+          case "$REQUESTED_ENVIRONMENT" in
+            staging)
+              echo "region=eu-west-1" >> "$GITHUB_OUTPUT"
+              echo "role=arn:aws:iam::123456789012:role/orders-staging-deploy" >> "$GITHUB_OUTPUT"
+              echo "cluster=staging" >> "$GITHUB_OUTPUT"
+              echo "service=orders" >> "$GITHUB_OUTPUT" ;;
+            production)
+              echo "region=eu-west-1" >> "$GITHUB_OUTPUT"
+              echo "role=arn:aws:iam::123456789012:role/orders-production-deploy" >> "$GITHUB_OUTPUT"
+              echo "cluster=production" >> "$GITHUB_OUTPUT"
+              echo "service=orders" >> "$GITHUB_OUTPUT" ;;
+            *) echo "unsupported environment" >&2; exit 2 ;;
+          esac
+
       - name: Assume the environment deployment role
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
-          role-to-assume: ${{ inputs.aws_role_arn }}
-          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ steps.target.outputs.role }}
+          aws-region: ${{ steps.target.outputs.region }}
 
       - name: Update the service
         env:
-          ECS_CLUSTER: ${{ inputs.cluster }}
-          ECS_SERVICE: ${{ inputs.service }}
+          ECS_CLUSTER: ${{ steps.target.outputs.cluster }}
+          ECS_SERVICE: ${{ steps.target.outputs.service }}
           TASK_DEFINITION_ARN: ${{ inputs.task_definition_arn }}
         run: |
           set -euo pipefail
@@ -142,8 +177,8 @@ jobs:
 
       - name: Wait for platform convergence
         env:
-          ECS_CLUSTER: ${{ inputs.cluster }}
-          ECS_SERVICE: ${{ inputs.service }}
+          ECS_CLUSTER: ${{ steps.target.outputs.cluster }}
+          ECS_SERVICE: ${{ steps.target.outputs.service }}
         run: |
           set -euo pipefail
           aws ecs wait services-stable \
@@ -333,6 +368,8 @@ automated PRs update other callers
     ↓
 old release deprecation window
 ```
+
+A compatible contract change adds an optional `wait_timeout_seconds` input with default `600`. Contract tests run both an old caller that omits it and a new caller that sets `900`; only after both pass does the team publish an immutable release SHA. Canary callers update first, automated PRs move the rest, and the old form remains supported through an announced deprecation window. Removing or making the input mandatory is reserved for a separately reviewed breaking release, never slipped into the existing release line.
 
 Options:
 

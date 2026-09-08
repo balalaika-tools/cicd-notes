@@ -24,6 +24,12 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - id: build
         uses: docker/build-push-action@v6
         with:
@@ -32,13 +38,22 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    environment: staging
     steps:
-      - run: echo "deploy ghcr.io/acme/orders@${{ needs.build.outputs.digest }}"
+      - name: Apply the digest and wait for it to serve
+        env:
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          kubectl set image deployment/orders orders="ghcr.io/acme/orders@${DIGEST}"
+          kubectl rollout status deployment/orders --timeout=5m
+          image_id="$(kubectl get pods -l app=orders -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')"
+          test "${image_id#*@}" = "$DIGEST"
 ```
 
-For this run, `steps.build.outputs.digest` resolves to `sha256:4ae0...9c1d`. The `deploy` job's log line reads `deploy ghcr.io/acme/orders@sha256:4ae0...9c1d` — the digest, not the tag `git-8f31c2a7d9`, is what actually reaches the environment.
+For this run, `steps.build.outputs.digest` resolves to `sha256:4ae0...9c1d`. The deployment sets that exact reference, waits for convergence, and refuses success unless a running pod's platform-reported `imageID` ends with the same digest.
 
-**Success signal:** the `deploy` job's log shows `deploy ghcr.io/acme/orders@sha256:4ae0...9c1d` — the same digest string the `build` job produced.
+**Success signal:** `kubectl rollout status` reports success and the final comparison matches `sha256:4ae0...9c1d`. The bounded external inputs are a pre-authenticated Kubernetes context for the `staging` environment and a deployment named `orders`; the environment administrator owns that credential and target mapping. `Unauthorized`, a missing context, or a different observed `imageID` fails the job.
 
 **Not handled yet:** [deterministic build inputs](#3-unpinned-build-inputs-make-two-identical-builds-different), [artifact vs. cache lifetime](#4-a-cache-hit-is-not-a-production-artifact), [promotion mechanics and GitOps](#5-promotion-moves-metadata-never-rebuilds-bytes), and [verifying attestations before trusting a promoted digest](#7-what-promotion-gets-wrong-in-production).
 
@@ -160,25 +175,27 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      KUBE_CONTEXT: ${{ vars.KUBE_CONTEXT }}
     steps:
+      - name: Authenticate to the reviewed staging cluster
+        run: ./scripts/configure-kube-context.sh "$KUBE_CONTEXT"
+
       - name: Deploy image@digest to staging
         env:
           IMAGE: ${{ needs.build.outputs.image }}
           DIGEST: ${{ needs.build.outputs.digest }}
         run: |
           set -euo pipefail
-          echo "Deploying ${IMAGE}@${DIGEST} to staging"
-          # Replace with your platform's deploy call (kubectl set image, aws ecs
-          # update-service, etc.) — the input contract is image + digest, never
-          # a tag. A deploy job shared across many services belongs in a
-          # reusable workflow rather than being copied per repository; see
-          # Reusable Workflows and Actions for that contract's permission
-          # ceiling and SHA-pinning rules.
+          kubectl set image deployment/orders orders="${IMAGE}@${DIGEST}"
+          kubectl rollout status deployment/orders --timeout=5m
+          image_id="$(kubectl get pods -l app=orders -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')"
+          test "${image_id#*@}" = "$DIGEST"
 ```
 
 `push-to-registry: true` above creates a storage record in the registry by default, which needs the `artifact-metadata: write` permission granted in `build`'s `permissions:` block — without it, the step fails once that default applies. If you don't want that record, pass `create-storage-record: false` instead of adding the permission. See [actions/attest usage](https://github.com/actions/attest#usage) and [Using artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) (checked 2026-08-14).
 
-The deploy job receives `image@digest`, never a mutable environment tag. Its `run:` step above is a stand-in for the platform-specific deploy call; extracting it into a shared, versioned reusable workflow — with its own permission ceiling and input contract — is the subject of [Reusable Workflows and Actions](04_reusable_workflows_and_actions.md).
+The deploy job receives `image@digest`, never a mutable environment tag, and the Kubernetes control plane confirms the running digest. The environment administrator owns `KUBE_CONTEXT`, its identity, and cluster authorization; repository YAML alone cannot prove those settings. Extracting this into a shared, versioned reusable workflow — with its own permission ceiling and input contract — is the subject of [Reusable Workflows and Actions](04_reusable_workflows_and_actions.md).
 
 For this run, `steps.build.outputs.digest` resolves to `sha256:4ae0...9c1d`, and the `deploy-staging` job logs `Deploying ghcr.io/acme/orders@sha256:4ae0...9c1d to staging`. Verifying the attestation before trusting that digest further confirms this workflow — not some other build — actually produced it:
 

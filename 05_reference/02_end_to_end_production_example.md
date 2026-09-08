@@ -26,16 +26,17 @@ Rebuild the image for staging and rebuild it again for production, and the two a
 
 ```bash
 # 1. Build once, push once — the registry returns a content-addressed digest.
-docker buildx build --push -t "$IMAGE:git-$GITHUB_SHA" .
+docker buildx build --push --metadata-file build-metadata.json -t "$IMAGE:git-$GITHUB_SHA" .
 digest=$(jq -r '."containerimage.digest"' build-metadata.json)   # sha256:4ae0...9c1d
 
 # 2. Deploy staging by that digest, then check it's really live.
-./scripts/register-task-definition.sh orders orders "$IMAGE" "$digest"   # -> orders:183
-aws ecs update-service --cluster staging --service orders --task-definition orders:183
+staging_td=$(./scripts/register-task-definition.sh orders orders "$IMAGE" "$digest")
+aws ecs update-service --cluster staging --service orders --task-definition "$staging_td"
 curl -fsS https://staging.orders.example.com/version | jq -r .digest   # => sha256:4ae0...9c1d
 
 # 3. Promote the identical digest to production — no rebuild, no new tag.
-aws ecs update-service --cluster production --service orders --task-definition orders:184
+production_td=$(./scripts/register-task-definition.sh orders orders "$IMAGE" "$digest")
+aws ecs update-service --cluster production --service orders --task-definition "$production_td"
 curl -fsS https://orders.example.com/version | jq -r .digest   # => sha256:4ae0...9c1d
 ```
 
@@ -151,6 +152,8 @@ GitHub environments:
 | `staging` | `main` only | Automated | `orders-staging-deploy` |
 | `production` | `main` or protected release refs | Independent approval or policy | `orders-production-deploy` |
 
+Repository files prove workflow definitions, `CODEOWNERS`, and requested environment names. The GitHub administrator owns effective rulesets, merge queue, environment ref restrictions, reviewers, bypass, and variables; export those settings and compare them with this table. A deliberately failing merge-group check must block merge, and a deployment from an unprotected ref must remain waiting with no environment credential. Inaccessible settings are `unknown`, never inferred from YAML.
+
 Environment role ARNs and non-secret target names belong in environment variables:
 
 ```text
@@ -163,7 +166,7 @@ vars.PUBLIC_BASE_URL
 
 ### The OIDC trust contract behind `vars.AWS_ROLE_ARN`
 
-Each role above is only as narrow as its IAM trust policy. Every trust policy must satisfy two conditions on the token GitHub mints for that job — a wrong or missing condition either breaks the assumption outright or, worse, lets a job it shouldn't trust succeed:
+An **ARN** (Amazon Resource Name) is the unique AWS role identifier stored in `vars.AWS_ROLE_ARN`. In the OIDC token, `aud` is the intended recipient and `sub` is the workload identity string the trust policy matches. Each role above is only as narrow as its IAM trust policy. Every trust policy must satisfy both conditions:
 
 | Role | `aud` condition | `sub` condition |
 |---|---|---|
@@ -490,6 +493,11 @@ jobs:
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -503,6 +511,18 @@ jobs:
           set -euo pipefail
           test "$IMAGE" = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/orders"
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+      - name: Verify the exact release signer before promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo acme/orders \
+            --signer-workflow acme/orders/.github/workflows/release.yml \
+            --source-ref refs/heads/main \
+            --source-digest "$GITHUB_SHA"
 
       - name: Assume environment deployment role
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
@@ -545,39 +565,29 @@ jobs:
         run: |
           ./scripts/smoke.sh \
             "$PUBLIC_BASE_URL" \
-            "$GITHUB_SHA"
+            "${{ inputs.digest }}"
 ```
 
-Values in the `vars` context are not automatically shell environment variables. Add an explicit job-level `env` mapping in the adopted workflow:
+Values in the `vars` context are not automatically shell environment variables. The job-level mapping is composed into the copyable workflow above; without it, shell references are unset. The mapping alone does not prove the GitHub environment's live values or owner.
 
-```yaml
-env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
-  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
-  PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
-```
-
-The separated snippet makes that boundary visible; without the mapping, shell references such as `$ECS_SERVICE` are unset.
-
-`smoke.sh` is the last step inside this reusable workflow — it runs once per environment, immediately after ECS reports steady state, using only the URL and commit SHA already in scope. It assumes the service exposes `GET /healthz` and `GET /version` (JSON: `status`, `commit`, `digest`):
+`smoke.sh` is the last step inside this reusable workflow — it runs once per environment, immediately after ECS reports steady state, using the URL and immutable digest already in scope. It assumes the service exposes `GET /healthz` and `GET /version` (JSON: `status`, `commit`, `digest`):
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 # Confirms the newly deployed task is actually serving traffic under the expected
 # commit — "steady state" only proves ECS accepted the task, not that requests succeed.
-base_url="${1:?usage: smoke.sh BASE_URL EXPECTED_SHA}"
-expected_sha="${2:?usage: smoke.sh BASE_URL EXPECTED_SHA}"
+base_url="${1:?usage: smoke.sh BASE_URL EXPECTED_DIGEST}"
+expected_digest="${2:?usage: smoke.sh BASE_URL EXPECTED_DIGEST}"
 
 health="$(curl -fsS --max-time 10 "$base_url/healthz")"
 test "$(jq -r '.status' <<<"$health")" = "ok"
 
 version="$(curl -fsS --max-time 10 "$base_url/version")"
-deployed_sha="$(jq -r '.commit' <<<"$version")"
-test "$deployed_sha" = "$expected_sha"
+deployed_digest="$(jq -r '.digest' <<<"$version")"
+test "$deployed_digest" = "$expected_digest"
 
-echo "smoke check passed: commit $deployed_sha is live at $base_url"
+echo "smoke check passed: digest $deployed_digest is live at $base_url"
 ```
 
 ---
@@ -664,20 +674,31 @@ Follow one push through every job above with concrete values:
 
 ## 9. ECS Can Roll Back Automatically, But Only After a Completed Deployment
 
-Configure the service:
+The AWS platform owner configures the ECS service and its **CloudWatch alarm** — an AWS metric threshold — in Terraform:
 
-```json
-{
-  "deploymentCircuitBreaker": {
-    "enable": true,
-    "rollback": true
+```hcl
+resource "aws_ecs_service" "orders" {
+  # ... cluster, task_definition, network configuration ...
+  deployment_circuit_breaker { enable = true, rollback = true }
+  alarms {
+    alarm_names = [aws_cloudwatch_metric_alarm.orders_5xx.alarm_name]
+    enable      = true
+    rollback    = true
   }
+}
+resource "aws_cloudwatch_metric_alarm" "orders_5xx" {
+  alarm_name          = "orders-production-5xx"
+  namespace           = "AWS/ApplicationELB"
+  metric_name         = "HTTPCode_Target_5XX_Count"
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 5
+  evaluation_periods  = 2
+  period              = 60
+  statistic           = "Sum"
 }
 ```
 
-Also configure CloudWatch alarms for application-level failure where appropriate. The circuit breaker can detect inability to reach steady state; alarms add service metrics that platform readiness may miss.
-
-Emit ECS deployment state-change events to EventBridge and alert on `SERVICE_DEPLOYMENT_FAILED`.
+An **EventBridge rule** — AWS event routing configured in the same control plane — matches ECS deployment state changes whose event name is `SERVICE_DEPLOYMENT_FAILED` and targets the on-call SNS/topic integration. Force a non-starting task in staging: `describe-services` must show the failed deployment and rollback to the prior completed task definition, while the alert contains the same deployment ID. A workflow log alone proves neither controller nor alert configuration.
 
 Automated ECS rollback still requires a previously completed deployment. The CI/CD workflow must observe the final service state rather than assuming the update request succeeded.
 
@@ -710,6 +731,37 @@ concurrency:
   queue: max
 ```
 
+The migration is a dedicated environment-scoped job and blocks deployment on failure:
+
+```yaml
+migrate-production:
+  environment: production
+  concurrency:
+    group: database-production-orders
+    cancel-in-progress: false
+    queue: max
+  runs-on: ubuntu-latest
+  steps:
+    - name: Run the immutable migration image once
+      env:
+        IMAGE: ${{ needs.build.outputs.image }}
+        DIGEST: ${{ needs.build.outputs.digest }}
+      run: |
+        set -euo pipefail
+        task_arn="$(aws ecs run-task --cluster production --task-definition orders-migration \
+          --overrides "$(./scripts/migration-overrides.sh "$IMAGE@$DIGEST")" \
+          --query 'tasks[0].taskArn' --output text)"
+        aws ecs wait tasks-stopped --cluster production --tasks "$task_arn"
+        test "$(aws ecs describe-tasks --cluster production --tasks "$task_arn" \
+          --query 'tasks[0].containers[0].exitCode' --output text)" = 0
+
+deploy-production:
+  needs: migrate-production
+  # ... call the deployment workflow ...
+```
+
+Exit `0` plus the migration tool's recorded schema version is completion evidence. A non-zero task exit fails `migrate-production`, so `deploy-production` never starts.
+
 > **Production:** the same reasoning as [the release workflow's concurrency block](#5-the-trusted-build-job-produces-one-attested-sha-pinned-image) applies here — without `queue: max`, only one migration run stays queued at a time, so a third push while one migration runs and one is already pending cancels the pending one instead of running it later. `queue: max` queues up to 100 pending runs per group instead of silently dropping one. ([Control workflow concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency), checked 2026-08-14)
 
 For a long backfill, start a separately observable operation and block only the release stage that truly depends on its completion.
@@ -732,6 +784,10 @@ Record after each completed deployment — this is the same production promotion
   "workflow_run_id": "8912345678"
 }
 ```
+
+Persist that record in the externally owned `deployment-records` DynamoDB table with conditional `PutItem`, a deploy-role writer identity, point-in-time recovery, denied update/delete permissions, and tamper-evident archive export. Store the returned `record_id` on the GitHub deployment status and read it back before declaring success.
+
+The rollback workflow accepts the incident and `record_id`, reads `previous_task_definition` from that durable item, updates ECS to that exact ARN, waits for stability, and verifies the runtime digest equals `previous_digest`. It never predicts a revision number or rebuilds a commit; a missing/revoked/incompatible record stops before `update-service`.
 
 Recovery sequence:
 

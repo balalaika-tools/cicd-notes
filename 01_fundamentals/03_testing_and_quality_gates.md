@@ -4,13 +4,13 @@
 
 ## The short version
 
-GitHub branch protection can only require a check by its exact job name, but a real CI workflow has several jobs whose names or count can shift between runs. The fix is one aggregator job with a single fixed name that reads its upstream jobs' results and becomes the only thing branch protection requires. Two upstream jobs plus that aggregator are enough to prove the merge-blocking mechanism end to end — every other test layer in this note plugs into the same aggregator later.
+GitHub branch protection identifies a check by name and, when configured, its expected GitHub App source, but a real CI workflow has several jobs whose names or count can shift between runs. The fix is one aggregator job with a single fixed name that reads its upstream jobs' results; the ruleset deliberately requires that one check from GitHub Actions even though it could require several checks. Two upstream jobs plus that aggregator are enough to prove the merge-blocking mechanism end to end — every other test layer in this note plugs into the same aggregator later.
 
 **What you need (3 things):**
 
 1. Two independent check jobs in one workflow (here, `lint` and `unit`).
 2. One aggregator job — named `required-ci` — that runs after them and reduces their results to a single pass/fail.
-3. A branch protection ruleset that requires exactly the name `required-ci`, not the jobs behind it.
+3. A branch protection ruleset that requires `required-ci` from the expected GitHub Actions App source, not merely any status with that name.
 
 **The code:**
 
@@ -32,12 +32,21 @@ jobs:
   required-ci:
     name: required-ci
     needs: [lint, unit]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - run: echo "required-ci: lint and unit both succeeded"
+      - name: Reject every non-success result
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          UNIT_RESULT: ${{ needs.unit.result }}
+        run: |
+          set -euo pipefail
+          test "$LINT_RESULT" = success
+          test "$UNIT_RESULT" = success
+          echo "required-ci: lint and unit both succeeded"
 ```
 
-**Success signal:** On a test PR, the merge box shows `required-ci` pending, then green once `lint` and `unit` both succeed. If either fails, GitHub skips `required-ci` (a `needs` dependency didn't succeed) and the merge box leaves it unresolved — the PR still can't merge, but the aggregator itself never explains why.
+**Success signal:** On a test PR, the merge box shows `required-ci` pending, then green once `lint` and `unit` both succeed. Force `unit` to exit 1: `required-ci` still runs because of `always()`, sees `UNIT_RESULT=failure`, exits non-zero, and turns red. Confirm the ruleset reports GitHub Actions as the expected source; a same-named result submitted by another integration must not satisfy it.
 
 **Not handled yet:** [optional and matrix-shaped jobs](#3-harden-the-required-check-so-a-skipped-job-cannot-pass-it), [testing only the changed part of a monorepo](#4-directory-filters-miss-consumers-whose-own-path-did-not-change), [flaky-test policy](#5-a-flaky-test-is-a-defect-not-noise-to-rerun-away), [preview-environment cleanup](#7-cleanup-must-refuse-a-bad-identifier-before-it-deletes-anything).
 
@@ -180,6 +189,14 @@ jobs:
 
 Configure the ruleset to require `required-ci`, not `lint`, `unit`, `integration`, or any matrix child individually.
 
+That instruction spans two owners. The repository maintainer owns the workflow name; a GitHub repository or organization administrator owns the effective ruleset. Inspect the active rulesets targeting `main` and require this entry:
+
+```json
+{"context":"required-ci","integration_id":15368}
+```
+
+Here `integration_id` identifies the expected GitHub App; obtain the live value from the check/ruleset API rather than copying the illustrative number. A same-named status from a different source is a failure tell, not a pass.
+
 Here's why the `case` statement is written this narrowly rather than accepting `skipped` for anything. Suppose someone later refactors `integration`'s `if:` condition and introduces a typo — the label match now always evaluates false. `integration` reports `needs.integration.result == "skipped"` on every PR, including ones that never asked to skip it, and nothing looks wrong because `skipped` is already an accepted value for that one job. If the same statement had instead treated `skipped` as acceptable for `unit` too — a plausible copy-paste — a similar typo in `unit`'s own condition would silently remove real test execution from every PR while `required-ci` still printed success and GitHub merged the change untested.
 
 ⚠️ The decision about whether a skipped job is acceptable belongs in reviewed code, scoped to the one job that is genuinely optional. Do not silently treat every `skipped` result as success.
@@ -208,6 +225,22 @@ changed paths
 
 Prefer an explicit dependency map over simple directory filters.
 
+For example, the detection job can read this small manifest:
+
+```yaml
+consumers:
+  shared: [orders, billing]
+  orders: [orders]
+  billing: [billing]
+```
+
+| Changed input | `orders` output | `billing` output |
+|---|---:|---:|
+| `shared/money.py` | `true` | `true` |
+| `services/orders/api.py` | `true` | `false` |
+
+The job emits those booleans through `$GITHUB_OUTPUT`; the two service jobs consume them in `if:` expressions. This makes the transitive selection reviewable instead of hiding it in directory glob behavior.
+
 > **Edge case:** a shared library bump only trips its own directory filter. Without a dependency map, every consumer that imports it skips testing entirely until the break shows up in staging.
 
 Use a detection job to emit service outputs, run conditional jobs, then let the stable final gate validate the outcomes. Keep a scheduled full build to catch mistakes in the dependency map.
@@ -226,18 +259,28 @@ first failure
                                       └── quarantine owner + expiry
 ```
 
-A flake policy should define:
+A **flake budget** is the allowed count or rate of first-attempt test failures during a stated window. Start with the starred fields; add the rest as the program matures. A flake policy should define:
 
-- which tests may retry;
-- maximum attempts;
-- a metric for first-attempt failures;
-- an owner and remediation deadline;
+- **★ which tests may retry;**
+- **★ maximum attempts;**
+- **★ a metric and budget for first-attempt failures;**
+- **★ an owner and remediation deadline;**
 - whether the test remains blocking;
 - the maximum allowed quarantine period.
 
 ❌ `pytest || pytest` makes an intermittent regression look green without producing structured evidence.
 
 ✅ A test runner plugin records retries, preserves the first failure, and fails when the flake budget is exceeded.
+
+```yaml
+window: 7d
+maximum_first_attempt_failure_rate: 0.01
+maximum_attempts: 2
+owner: team-payments
+remediate_within: 5d
+```
+
+If `payments_retry_test` fails first on 18 of 1,000 runs, the report shows `1.8% > 1.0%` and the policy check fails even if every retry passes.
 
 ---
 
@@ -256,6 +299,16 @@ Pipeline code changes production. Test it accordingly:
 | OIDC policy | Positive and negative assumption tests |
 
 A workflow that deploys to cloud infrastructure typically assumes a cloud role through **OIDC** — OpenID Connect, a protocol where GitHub issues the running workflow a short-lived signed token carrying claims such as `repo:org/repo:ref:refs/heads/main`, and the cloud provider's trust policy checks those claims before handing back temporary credentials. "Positive and negative assumption tests" means exactly that exchange, tested both ways: a run from an allowed branch should receive credentials, and a run from a fork or a disallowed ref should be refused.
+
+This explanatory trust-policy excerpt makes the evaluated fields visible; the complete cloud policy is owned by [Permissions, Secrets, and OIDC](../03_security_and_supply_chain/01_permissions_secrets_and_oidc.md):
+
+```json
+{"iss":"https://token.actions.githubusercontent.com","aud":"sts.amazonaws.com","sub":"repo:acme/orders:ref:refs/heads/main"}
+```
+
+An assumption attempt with that exact issuer, audience, repository, and ref is allowed. Change only `sub` to `repo:acme/orders:pull_request` and the cloud security-token service returns access denied. If the cloud or runner settings cannot be queried, record them as `unknown`: repository YAML proves declared permissions and runner labels, not the effective OIDC trust or runner-group assignment.
+
+Use the same evidence inventory whenever a gate crosses systems: list the repository artifact, each linked GitHub/cloud/runner control plane, its owner and authoritative query, current access limitations, confirmed facts, and hypotheses. Close the loop with an observed red check, refused credential, or actual runner assignment; never infer external configuration from repository silence.
 
 Suppose a contributor edits the deployment workflow to add `permissions: id-token: write` where it wasn't needed before, or widens that trust condition so any branch — not only `main` — can assume the deploy role. The next PR opened from that branch now receives real production credentials through the OIDC exchange above. Or, instead, they change `runs-on` to a self-hosted runner label they control, and their workflow executes on hardware with whatever network access and cached credentials that runner already has. Neither change touches application code, so application tests catch nothing.
 

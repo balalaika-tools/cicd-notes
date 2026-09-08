@@ -4,7 +4,7 @@
 
 ## The short version
 
-Five differently named checks on a pull request give a **ruleset** — the policy object that names the single status check a merge requires — nothing stable to point at, and give a **merge queue** — GitHub's temporary environment where several merge candidates are re-validated together right before landing — no single verdict to wait on. The fix is structural: run independent validation jobs in parallel, then let one aggregator job report the only name anything downstream depends on. Three pieces are enough to prove the pattern end to end: a trigger, at least one validation job, and an aggregator that turns any non-success result into a loud failure.
+Five differently named checks on a pull request give a **ruleset** — the policy object that can name one or more status checks a merge requires — an unstable contract, and give a **merge queue** — GitHub's temporary environment where several merge candidates are re-validated together right before landing — no single verdict to wait on. The fix is structural: run independent validation jobs in parallel, then deliberately expose one stable aggregator name. Three pieces are enough to prove the pattern end to end: a trigger, at least one validation job, and an aggregator that turns any non-success result into a loud failure.
 
 **What you need (3 things):**
 1. A `pull_request` trigger scoped to the branch you protect.
@@ -39,8 +39,8 @@ jobs:
           test "${{ needs.lint.result }}" = "success"
           test "${{ needs.test.result }}" = "success"
 ```
-**Success signal:** the pull request shows one green `required-ci` check, and that is the only check the branch ruleset needs to require. **Silent-skip tell:** if `lint` or `test` never runs at all — a path filter excluded the change, or the workflow file has a syntax error — GitHub skips them, and without `if: always()` the aggregator would silently skip too, posting no result rather than a failure. The explicit `test "$RESULT" = "success"` lines are what turn that silent skip into a visible red check instead of a merge nobody actually blocked.
-**Not handled yet:** locked and hashed dependencies, timeouts, and real container validation in the [full hardened workflow](#1-one-required-check-survives-any-number-of-jobs); [ordering jobs for fast failure](#2-parallel-jobs-are-fastest-serial-jobs-waste-less-compute); [fork PR isolation](#3-fork-prs-never-get-secrets-or-privileged-runners); the [`pull_request_target` privilege trap](#4-pull_request_target-runs-with-the-target-repositorys-privileges); [security-scanning evidence](#5-name-what-each-security-check-actually-catches); [keeping the check name stable under a matrix](#6-the-required-check-name-is-a-contract-not-a-label); and [what PR artifacts may hold](#7-pr-artifacts-are-evidence-not-a-release-candidate).
+**Success signal:** the pull request shows one green `required-ci` check, and this design deliberately makes that the only check the branch ruleset requires. `if: always()` handles jobs that exist in the same run but were skipped or failed because of `if`/`needs`; the explicit result tests turn those states red. It cannot rescue a whole workflow that never starts. A path filter excluding the workflow leaves the required check pending, and invalid workflow syntax prevents the aggregator job from being created at all.
+**Not handled yet:** locked and hashed dependencies, timeouts, and real container validation in the [full hardened workflow](#1-one-required-check-survives-any-number-of-jobs); [ordering jobs for fast failure](#2-parallel-jobs-are-fastest-serial-jobs-waste-less-compute); [fork PR isolation](#3-fork-prs-get-restricted-authority-only-when-administrators-keep-that-policy); the [`pull_request_target` privilege trap](#4-pull_request_target-runs-with-the-target-repositorys-privileges); [security-scanning evidence](#5-name-what-each-security-check-actually-catches); [keeping the check name stable under a matrix](#6-the-required-check-name-is-a-contract-not-a-label); and [what PR artifacts may hold](#7-pr-artifacts-are-evidence-not-a-release-candidate).
 
 ---
 
@@ -189,7 +189,13 @@ jobs:
 
 > **Production:** every difference from the baseline fixes one failure mode: `--require-hashes` stops a floating dependency from changing behavior between runs (see [§8](#8-a-green-check-can-still-hide-a-bad-merge)); `timeout-minutes` stops one hung step from blocking the whole queue; and the container job actually starts the image and polls `/health/ready` instead of trusting a successful `docker build`.
 
-Configure `required-ci` as the ruleset's required status check.
+The repository administrator owns the effective ruleset. Its exported required-check entry should identify both the exact context and the expected GitHub Actions App source:
+
+```json
+{"context":"required-ci","integration_id":15368}
+```
+
+Resolve the live App ID from the check/ruleset API; the number above is illustrative. Verify the boundary with a PR that deliberately fails `test`: `required-ci` turns red and the merge button remains disabled. A same-named status from another App must not satisfy the rule; a permanently "Expected" check usually means the trigger or context name drifted.
 
 ---
 
@@ -218,7 +224,7 @@ For most teams, cheap independent checks in parallel followed by expensive integ
 
 ---
 
-## 3. Fork PRs Never Get Secrets or Privileged Runners
+## 3. Fork PRs Get Restricted Authority Only When Administrators Keep That Policy
 
 Code from a fork is untrusted. The normal `pull_request` event is designed for validation with restricted access.
 
@@ -235,6 +241,8 @@ permissions:
 - Do not send untrusted builds to persistent privileged runners.
 - Do not publish fork-built artifacts as trusted releases.
 - Treat caches and uploaded artifacts from low-trust runs as untrusted.
+
+For private and internal repositories, administrators can enable write tokens or secrets for fork workflows. Inspect the repository or organization Actions setting before claiming isolation; the workflow file cannot prove it. The owner should keep fork write tokens/secrets disabled and verify with a fork PR that the token cannot write and the secret is absent. If the run can create a test issue or prints a secret-presence sentinel, the external setting widened authority and the isolation claim is false.
 
 > **Edge case:** if a PR needs a live preview environment, use a reviewed approval gate or a separate privileged workflow that consumes a narrowly validated artifact and never executes scripts from it — most PR checks never need this.
 

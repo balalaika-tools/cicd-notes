@@ -4,7 +4,7 @@
 
 ## The short version
 
-A container image tag is a movable pointer — `ghcr.io/acme/orders:latest` can point at different bytes an hour from now, so trusting the tag alone tells a deploy pipeline nothing about what it's actually about to run. An **artifact digest** (the immutable `sha256:...` hash of the exact bytes) fixes *what* you're trusting, and a **provenance attestation** — a signed, machine-readable claim, cryptographically bound to that digest, stating which repository, commit, and workflow built it — fixes *where it came from*. Binding both to one digest and having a consumer check them before deploy turns "we build in CI" from a claim in a runbook into something a machine enforces on every release.
+A container image tag in **GitHub Container Registry (GHCR)** — `ghcr.io/acme/orders:latest` — is a movable pointer and can point at different bytes an hour from now, so trusting the tag alone tells a deploy pipeline nothing about what it's actually about to run. An **artifact digest** (the immutable `sha256:...` hash of the exact bytes) fixes *what* you're trusting, and a **provenance attestation** — a signed, machine-readable claim, cryptographically bound to that digest, stating which repository, commit, and workflow built it — fixes *where it came from*. Binding both to one digest and having a consumer check them before deploy turns "we build in CI" from a claim in a runbook into something a machine enforces on every release.
 
 **What you need (3 things):**
 
@@ -156,7 +156,10 @@ jobs:
         run: |
           gh attestation verify \
             oci://ghcr.io/acme/orders@${{ steps.build.outputs.digest }} \
-            --repo ${{ github.repository }}
+            --repo ${{ github.repository }} \
+            --signer-workflow acme/orders/.github/workflows/release.yml \
+            --source-ref refs/heads/main \
+            --source-digest ${{ github.sha }}
 ```
 
 Every action above is pinned to the reviewed full commit SHA behind its release tag — the trailing comment is for humans and Dependabot/Renovate, not the resolver. See [Only a Full Commit SHA Actually Pins an Action](02_workflow_and_runner_hardening.md#2-only-a-full-commit-sha-actually-pins-an-action) for why a movable tag defeats this entire evidence chain even when every step above is otherwise correct: an attacker who moves one of these tags after review gets executed with the release job's `packages: write` and `attestations: write` authority, the same as any other step.
@@ -209,7 +212,19 @@ Availability varies by repository visibility and plan. At the time of writing, p
 
 GitHub uses Sigstore for attestation signing. Public and private repositories use different Sigstore trust/storage arrangements; consumers should verify through supported tooling rather than assuming all bundles share the public transparency log.
 
-> **Edge case:** GitHub-hosted attestations assume consumers are willing to trust GitHub's own identity and API availability as part of the verification path. That doesn't hold everywhere — a consumer that needs forge-neutral trust (verification that doesn't depend on GitHub as a party), fully offline verification with no call to the GitHub API at deploy time, or a signing identity governed by an organization other than the one operating the repository should sign and verify with a standalone Sigstore/cosign workflow instead, where your own policy — not GitHub's API — decides what's trusted.
+GitHub attestations can be carried into an offline verifier. In a connected staging area, download the bundle and trusted root through an authenticated, reviewed channel; transfer both out of band, then run:
+
+```bash
+gh attestation verify ./orders-server \
+  --bundle orders.bundle.jsonl \
+  --custom-trusted-root github-trusted-root.jsonl \
+  --repo acme/orders \
+  --signer-workflow acme/orders/.github/workflows/release.yml \
+  --source-ref refs/heads/main \
+  --source-digest 8f31c2a7d9...
+```
+
+This removes the deploy-time API call, not GitHub from the trust model. Use standalone Sigstore/cosign when the requirement is forge-neutral identity governance or a signing authority operated outside GitHub, not merely offline operation.
 
 ---
 
@@ -221,7 +236,10 @@ Binary:
 
 ```bash
 gh attestation verify ./dist/orders-server \
-  --repo acme/orders
+  --repo acme/orders \
+  --signer-workflow acme/orders/.github/workflows/release.yml \
+  --source-ref refs/heads/main \
+  --source-digest 8f31c2a7d9...
 ```
 
 Container:
@@ -229,7 +247,10 @@ Container:
 ```bash
 gh attestation verify \
   oci://ghcr.io/acme/orders@sha256:4ae0...9c1d \
-  --repo acme/orders
+  --repo acme/orders \
+  --signer-workflow acme/orders/.github/workflows/release.yml \
+  --source-ref refs/heads/main \
+  --source-digest 8f31c2a7d9...
 ```
 
 SPDX SBOM attestation:
@@ -237,6 +258,9 @@ SPDX SBOM attestation:
 ```bash
 gh attestation verify ./dist/orders-server \
   --repo acme/orders \
+  --signer-workflow acme/orders/.github/workflows/release.yml \
+  --source-ref refs/heads/main \
+  --source-digest 8f31c2a7d9... \
   --predicate-type https://spdx.dev/Document/v2.3
 ```
 
@@ -257,7 +281,7 @@ Verification policy should check:
 **How you know it's working:** running the container command above against a digest that really was built and attested by `acme/orders` prints the enforced policy criteria, then the fields that matched, and exits `0`:
 
 ```text
-$ gh attestation verify oci://ghcr.io/acme/orders@sha256:4ae0...9c1d --repo acme/orders
+$ gh attestation verify oci://ghcr.io/acme/orders@sha256:4ae0...9c1d --repo acme/orders --signer-workflow acme/orders/.github/workflows/release.yml --source-ref refs/heads/main --source-digest 8f31c2a7d9...
 Loaded digest sha256:4ae0...9c1d for oci://ghcr.io/acme/orders@sha256:4ae0...9c1d
 Loaded 1 attestation from GitHub API
 
@@ -289,6 +313,8 @@ Loaded digest sha256:4ae0...9c1d for oci://ghcr.io/acme/orders@sha256:4ae0...9c1
 Error: HTTP 404: Not Found (https://api.github.com/repos/acme/other-repo/attestations/sha256:4ae0...9c1d...)
 ```
 
+A digest attested by `nightly.yml` in the same repository fails the `--signer-workflow .../release.yml` constraint before deployment. That negative test is essential: repository identity alone is not signer-workflow identity.
+
 Exit status `1`. Treat any nonzero exit as "do not deploy" in a script — never grep the output for a specific error string, since GitHub can change the wording without notice.
 
 > **Key insight**: an attestation is only as valuable as the policy a consumer actually enforces against it — generating one without a verification gate is, to everything downstream, indistinguishable from never having generated it at all. The evidence and the check that reads it are one mechanism, not two independent features.
@@ -315,6 +341,27 @@ artifacts:
 migrations:
   target: "2026_07_29_01"
 ```
+
+Attest the manifest itself as a release subject, then verify it before checking membership:
+
+```yaml
+- uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+  with:
+    subject-path: release-manifest.yaml
+```
+
+```bash
+manifest_digest="sha256:$(sha256sum release-manifest.yaml | cut -d' ' -f1)"
+gh attestation verify release-manifest.yaml \
+  --repo acme/orders \
+  --signer-workflow acme/orders/.github/workflows/release.yml \
+  --source-ref refs/heads/main \
+  --source-digest 8f31c2a7d9...
+CANDIDATE_DIGEST=sha256:82bd...7af0 yq -e \
+  '.artifacts[].digest == env(CANDIDATE_DIGEST)' release-manifest.yaml
+```
+
+Verification binds the manifest bytes to the release workflow. A component digest with its own valid attestation is still rejected when it is absent from this verified manifest; independent validity does not make it part of this release.
 
 Sign or attest the manifest, then deploy only artifact identities listed in it. This prevents a deployment from combining independently valid but incompatible components.
 
@@ -372,7 +419,7 @@ The tag can later reference different content. Bind evidence to the digest.
 
 **The attestation is stored beside an overwritable artifact**
 
-Protect registry immutability and retention. Valid provenance for deleted content does not preserve availability.
+The registry administrator owns deletion access and retention. Inspect the live package/version API and scheduled reconciliation report, not repository YAML: it must show each promoted digest retained while referenced by an active environment and deny tag mutation or detect it by comparing the tag's resolved digest to the release record. A tag resolving to a new digest is a mutable-subject failure; a `manifest unknown` pull for a retained digest is premature deletion. Valid provenance for deleted content does not preserve availability.
 
 **Only build-time scanning exists**
 

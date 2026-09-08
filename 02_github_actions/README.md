@@ -17,6 +17,8 @@
 | [04_reusable_workflows_and_actions.md](04_reusable_workflows_and_actions.md) | Reuse | Reusable workflows, composite actions, and organization templates |
 | [05_cross_repository_orchestration.md](05_cross_repository_orchestration.md) | Cross-repository delivery | Dispatch, GitOps, versioned dependencies, and synchronization |
 | [06_performance_and_reliability.md](06_performance_and_reliability.md) | Pipeline operations | Matrices, caches, concurrency, timeouts, reruns, and cost |
+| [07_external_repository_integrations.md](07_external_repository_integrations.md) | External integrations | Discover owners, bindings, unknowns, and runtime evidence |
+| [08_cross_repository_contract_lifecycle.md](08_cross_repository_contract_lifecycle.md) | Contract lifecycle | Publish, pin, update, test, and deprecate cross-repository contracts |
 
 ---
 
@@ -33,7 +35,9 @@
 
    **Stop here** if one repository owns the shared logic others call. Continue when your pipeline must trigger, wait on, or react to work in *other* repositories.
 5. **Cross-repository orchestration** — coordinate independent repositories
-6. **Performance and reliability** — tune the resulting system
+6. **External repository integrations** — prove service-side bindings and runtime effects
+7. **Cross-repository contract lifecycle** — carry a library/schema relationship through deprecation
+8. **Performance and reliability** — tune the resulting system
 
 ---
 

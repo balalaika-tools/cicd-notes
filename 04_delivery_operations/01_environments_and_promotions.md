@@ -69,6 +69,23 @@ An environment can define:
 - custom deployment protection rules;
 - whether administrators may bypass protection.
 
+The environment administrator should export and review the effective GitHub-owned configuration, for example:
+
+```json
+{
+  "name": "production",
+  "deployment_branch_policy": {"protected_branches": true, "custom_branch_policies": false},
+  "protection_rules": [
+    {"type": "required_reviewers", "reviewers": ["acme/release-managers"], "prevent_self_review": true},
+    {"type": "branch_policy"},
+    {"type": "custom", "app": "change-policy"}
+  ],
+  "can_admins_bypass": false
+}
+```
+
+The workflow proves only `environment: production`; this response proves allowed refs, reviewers, self-review, admin bypass, custom protection Apps, and whether enforcement is active. Record inaccessible fields as `unknown`, assign the repository/environment administrator as owner, and compare the export with the reviewed baseline on a schedule. A test run from an unprotected ref must remain blocked and receive no production credential.
+
 > **Production:** required reviewers is usually the first control a team reaches for, but its default behavior is narrower than the name suggests: it takes only **one** approval from up to six listed users or teams. GitHub does not ship an all-reviewers or N-of-M quorum mode here — a single approver among the six is sufficient, and a single compromised or careless one is enough to approve. If a release genuinely needs independent multi-party sign-off, enforce that with a [custom deployment protection rule](#6-protection-rules-should-gate-on-evidence-not-elapsed-time) backed by an external approval service that itself tracks and requires multiple distinct approvers ([Deployments and environments — required reviewers](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#required-reviewers), checked 2026-08-14).
 
 A job referencing an environment waits for its protection rules before it starts and before it can access environment secrets.
@@ -203,7 +220,7 @@ The central workflow SHA is illustrative and must be replaced by the approved im
 
 `--repo` alone only scopes the *search* for attestations to `acme/orders` — it does not restrict which workflow inside that repository produced one, and the CLI documents repository scope as the minimum, not the whole policy. A renamed, stale, or unofficial workflow still living in `acme/orders` can publish an attestation that passes `--repo acme/orders` on its own. `--signer-workflow` pins verification to the one workflow, on the one ref, allowed to build this image ([gh attestation verify](https://cli.github.com/manual/gh_attestation_verify), checked 2026-08-14).
 
-A run that behaves correctly leaves a specific trail: `validate-release` succeeds with no output beyond the tool's own confirmation — a non-zero exit here stops the workflow before either environment is touched; the `staging` job's entry shows environment `staging` with a `Success` status, and querying the target confirms the promoted digest is what's actually running (for example, the ECS task definition's image resolves to the same `sha256:...`); `verify-staging` exits `0`; and the `production` job's entry in the repository's **Environments** tab shows a completed review — reviewer, timestamp, environment name — before its own `Success` status, with the deployed digest again matching.
+A run that behaves correctly leaves a specific trail: `validate-release` succeeds before either environment is touched; the staging job shows `Success`; and the Amazon **Elastic Container Service (ECS)** task definition — the AWS control-plane object whose image is resolved for running tasks — reports the same digest. `verify-staging` exits `0`; the production environment records reviewer and timestamp before `Success`; and its task definition again resolves to that digest.
 
 ⚠️ The most common silent failure here is not a rejected deployment — it's an *unenforced* gate that nobody notices because every run still looks green. If the `production` environment has no required reviewers configured (removed, or never added when the environment was created), the `production` job starts the instant `verify-staging` finishes: there is no "Waiting for review" step in the run timeline, and the environment's deployment history shows no reviewer entry — but the workflow still reports `Success`, so nothing in the usual run summary flags that the approval never happened. Check the **Environments** tab's protection-rule list for the target itself, not just the workflow's pass/fail status.
 
@@ -264,18 +281,18 @@ If an approval may wait for days, avoid depending on ephemeral workspace state o
 
 ## 6. Protection Rules Should Gate on Evidence, Not Elapsed Time
 
-Useful gates:
+Start with the three starred gates for the baseline; add conditional gates only when their evidence exists. Useful gates:
 
-- independent change approval;
+- **★ independent change approval;**
 - change-window or freeze policy;
 - incident status;
 - security or vulnerability policy;
-- staging deployment and test result;
-- observability health;
+- **★ staging deployment and test result;**
+- **★ observability health;**
 - service ownership;
 - regulatory change record.
 
-> **Edge case:** GitHub custom deployment protection rules can integrate GitHub Apps with observability or change-management systems. At the time of writing, this feature is in public preview and plan availability varies — confirm it's available on your plan before designing a gate around it.
+A custom protection App receives `{environment:"production", digest:"sha256:4ae0...9c1d", staging_run:8912}`. It queries the staging result and error-rate window, then returns `approved` only when both match that digest and policy; otherwise it returns `rejected` with the evidence URL. GitHub shows the deployment job as waiting while the decision is pending and failed when rejected. Custom deployment protection rules have plan-dependent limits for private repositories, so confirm plan support before making one the sole gate.
 
 Avoid fixed wait timers unless the elapsed time itself provides evidence. A **canary** — routing a small slice of traffic or instances to the new version while the rest keep serving the old one — paired with a **bake period** — a fixed window afterward spent only observing that slice's health before continuing further — is a stronger gate than an arbitrary delay with no measurement: the wait is doing something, not just passing time.
 

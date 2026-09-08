@@ -10,7 +10,7 @@ A repository secret holding one permanent AWS key gives every job in every workf
 
 1. `id-token: write` permission on the job that requests the token.
 2. An OIDC identity provider registered in the cloud account (`token.actions.githubusercontent.com` for AWS).
-3. A cloud role trust policy that checks the token's `aud` and `sub` claims.
+3. A cloud role trust policy that checks `aud` (the intended token recipient) and `sub` (the workload identity string matched by policy).
 4. An action that exchanges the token for credentials — `aws-actions/configure-aws-credentials`, shown below.
 
 **The code:**
@@ -192,7 +192,7 @@ GitHub Actions job
 GitHub OIDC issuer
     │ signs claims: repository, ref/environment, workflow, run, runner...
     ▼
-Cloud security token service
+Cloud security token service (AWS STS, Security Token Service)
     │ validates issuer + audience + subject conditions
     ▼
 Short-lived role credentials
@@ -266,6 +266,16 @@ AWS role trust policy for a repository using the historical name-based default O
 ```
 
 When the subject is environment-based, the branch is not included in the default `sub`. Protect the GitHub environment so only the intended branches or tags may deploy.
+
+That protection spans external owners:
+
+| Control | Owner and authoritative source | Repository proves | Live proof |
+|---|---|---|---|
+| Environment branch/ref policy | GitHub environment administrator; environment API/settings | Only that the job requests `environment: production` | API response lists allowed deployment branches/tags and an unprotected-ref run is refused before secrets/credentials |
+| OIDC subject format | GitHub repository administrator; OIDC customization API plus an inspected token | `id-token: write` is requested | decoded token `sub` matches the reviewed IAM condition |
+| AWS trust | Cloud security owner; `aws iam get-role` | role ARN requested by YAML | allowed context succeeds and a changed repo/ref/environment returns `AccessDenied` |
+
+If any administrator cannot query their surface, record the field as `unknown`; checked-in YAML cannot establish environment reviewers, allowed refs, subject customization, or live IAM trust.
 
 Confirm the condition actually rejects what it should, rather than assuming it does: trigger the same job from a context it's meant to reject — a different repository, or an unprotected branch if the role is bound to `environment:production` — and expect `configure-aws-credentials` to fail before `get-caller-identity` ever runs:
 
@@ -373,13 +383,32 @@ A GitHub App:
 
 ```yaml
 - id: app-token
-  uses: actions/create-github-app-token@v3 # Pin in production.
+  uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
   with:
     client-id: ${{ vars.CICD_APP_CLIENT_ID }}
     private-key: ${{ secrets.CICD_APP_PRIVATE_KEY }}
     owner: acme
     repositories: platform-deployments
 ```
+
+The GitHub App administrator owns this external installation contract:
+
+```json
+{
+  "permissions": {"contents": "write", "actions": "read"},
+  "repository_selection": "selected",
+  "repositories": ["platform-deployments"]
+}
+```
+
+After minting the token, prove both sides of the boundary:
+
+```bash
+GH_TOKEN="$APP_TOKEN" gh api repos/acme/platform-deployments --jq .full_name
+GH_TOKEN="$APP_TOKEN" gh api repos/acme/payments-internal --silent
+```
+
+The first prints `acme/platform-deployments`; the second returns `404 Not Found` because that repository is outside the installation. The workflow can prove token behavior, but only the App settings/API proves the registered permission set and selected repositories. [GitHub App Provisioning and Credential Lifecycle](05_github_app_provisioning.md) owns creation, key rotation, audit identity, and revocation.
 
 Restrict where the private key is available. If every repository can mint the app token, the app's narrow installation is no longer a meaningful repository boundary.
 
@@ -417,4 +446,4 @@ Derived, encoded, or structured secret values may not redact. Prevent output rat
 
 ---
 
-**Next**: [Workflow and Runner Hardening](02_workflow_and_runner_hardening.md)
+**Next**: [GitHub App Provisioning and Credential Lifecycle](05_github_app_provisioning.md)

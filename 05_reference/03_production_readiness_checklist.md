@@ -4,6 +4,26 @@
 
 ---
 
+## How to Use This Checklist
+
+Start with [the recommended first ten improvements](#13-recommended-first-ten-improvements), then use the domain sections below for the control under review and the [maturity ladder](#12-maturity-ladder) for sequencing.
+
+Every checked item needs three evidence fields in the review record:
+
+| Field | Meaning | Example |
+|---|---|---|
+| Configuration owner | Person/team able to change the effective control | GitHub organization administrator |
+| Source of truth | Authoritative repository file or external settings/API | active ruleset export, not only workflow YAML |
+| Live verification | Observation proving the controller acted | failing PR blocked; unprotected deploy refused; runtime digest matched |
+
+Mark inaccessible external state `unknown`, not pass. Repository-visible intent, external control-plane configuration, and runtime proof are separate evidence classes.
+
+> **Core:** a checkbox is complete only when it names who owns the effective control, where that state is authoritative, and the live observation proving it acted.
+
+> **Key insight**: checked-in configuration proves intent; a production-readiness claim requires effective control-plane state and runtime evidence as well.
+
+---
+
 ## 1. Source and Change Control
 
 - [ ] The default branch is protected by a ruleset or branch protection.
@@ -134,7 +154,7 @@
 ## 8. Deployment Safety
 
 - [ ] Production deployments are serialized per target.
-- [ ] The team understands that GitHub concurrency is not a durable FIFO queue.
+- [ ] The team distinguishes default `queue: single` (one pending run), native `queue: max` (bounded queue of up to 100 pending runs), and an external durable FIFO queue required beyond those limits.
 - [ ] The rollout strategy matches state, capacity, routing, and observability constraints.
 - [ ] Old and new versions are API, configuration, and data compatible during overlap.
 - [ ] Readiness, liveness, and startup checks have distinct semantics.

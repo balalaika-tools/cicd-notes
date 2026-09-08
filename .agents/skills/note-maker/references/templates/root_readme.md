@@ -1,6 +1,8 @@
-# Root README.md Template
+# Site Index Template
 
-The landing page for the entire notes repo. Tells readers what it covers, how it's organized, and where to start.
+The canonical landing page for the notes collection. In an MkDocs collection this is
+`docs/index.md`; in a Markdown-only collection it is the root `README.md`. It tells readers what
+the collection covers, how it is organized, and where to start.
 
 For badge hex codes and logo names, see `../badges.md`.
 
@@ -18,20 +20,29 @@ For badge hex codes and logo names, see `../badges.md`.
 
 ---
 
-## Structure
+## Explore by area
 
-\```
-{repo-name}/
-│
-│ ── CATEGORY NAME ──────────────────────────────────────
-├── category/
-│   ├── sub_topic/       Short description of what's here
-│   └── other_topic/     Short description
-│
-│ ── ANOTHER CATEGORY ───────────────────────────────────
-└── another/
-    └── sub/             Description
-\```
+<div class="grid cards" markdown>
+
+-   **{Area name}**
+
+    {One sentence describing the questions this area helps the reader answer.}
+
+    [{Start or explore label} →]({area}/index.md)
+
+-   **{Area name}**
+
+    {One sentence describing the concrete capabilities covered here.}
+
+    [{Start or explore label} →]({area}/index.md)
+
+-   **{Area name}**
+
+    {One sentence describing the systems, trade-offs, or workflows covered here.}
+
+    [{Start or explore label} →]({area}/index.md)
+
+</div>
 
 ---
 
@@ -70,8 +81,12 @@ For badge hex codes and logo names, see `../badges.md`.
 
 ## Key rules
 
-- The ASCII tree uses box-drawing: `├──`, `└──`, `│` — with inline descriptions after directory names
-- Category headers in the tree use `── CAPS ──` decorative lines
+- Start with an **Explore by area** overview organized around reader intent, not directory shape
+- In MkDocs Material, use a card grid and link every card to its section `index.md`
+- In Markdown-only collections, replace the cards with a compact Area / Covers / Start here table
+- Keep card titles and descriptions parallel, concise, and free of decorative emoji
+- Add a small `Repository layout` tree only when contributors genuinely need it; it is secondary,
+  never the primary navigation
 - The Contents section groups files by category with a markdown table per group
 - Reading Order has 2–4 named paths for different experience levels or goals
 - Every path reaches a runnable result or concrete worked outcome within its first two entries
@@ -79,3 +94,5 @@ For badge hex codes and logo names, see `../badges.md`.
 - One named path is for a first-time reader and reaches a complete useful outcome before production deep dives or references
 - Each path states its audience, working result, and stop point
 - Omit the `*Last updated*` line unless the user requests it — it goes stale immediately
+- In MkDocs mode, write this template to `docs/index.md`; do not duplicate it in the repository
+  `README.md`

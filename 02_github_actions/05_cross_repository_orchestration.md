@@ -6,7 +6,7 @@
 
 ## The short version
 
-A workflow in Repo A cannot call a workflow in Repo B directly — GitHub Actions has no cross-repository function call, only events one repository can ask another to receive. Cross-repository orchestration means choosing which event fits the relationship (a dispatch, a pull request, a package release) and which credential is allowed to raise it: the workflow's automatic `GITHUB_TOKEN` — a short-lived installation token scoped only to its own repository — cannot reach across that boundary. The trace below is the shape nearly every pattern in this note reduces to: an authenticated request from Repo A, accepted asynchronously by Repo B, and independently verified before Repo B acts on it.
+A workflow in Repo A can call a permitted reusable workflow stored in Repo B, but that workflow is incorporated into Repo A's run. Starting a distinct run owned by Repo B requires an event such as dispatch, a pull request, or a package release. Cross-repository orchestration means choosing which relationship you need and which credential, if any, may cross the repository boundary. The trace below shows the distinct-run dispatch case: an authenticated request from Repo A, accepted asynchronously by Repo B, and independently verified before Repo B acts on it.
 
 **What you need (3 things):**
 
@@ -32,7 +32,7 @@ build succeeds on main
                                   "Receive release candidate" run starts
 ```
 
-**Success signal:** within seconds of the 202 response, a new run of Repo B's "Receive release candidate" workflow appears in Repo B's Actions tab, triggered by `repository_dispatch`.
+**Success signal:** the `202` proves only event acceptance. Completion evidence is a new Repo B "Receive release candidate" run URL followed by its terminal result. If no run appears, check that the receiver exists on the default branch, its `types` includes the event type, and the App installation can access Repo B.
 
 **Not handled yet:** [binding that artifact to the expected signer workflow and commit before trusting it](#3-a-dispatch-payload-is-a-claim-not-proof) and [tracking the destination run to a reported result instead of an accepted request](#5-accepted-is-not-completed-dispatch-needs-correlation-and-a-timeout).
 
@@ -54,6 +54,7 @@ For background on packaging a shared CI/CD implementation before you dispatch be
 | Update consumers of a library | Publish a version; dependency-update PRs |
 | Distribute duplicated policy/configuration | Automated synchronization PR |
 | Detect a source that cannot emit events | Scheduled polling |
+| Let an installed GitHub App or SaaS reconcile repository input | Externally managed integration with independent runtime verification |
 
 ```text
 reuse       = same workflow run, shared implementation
@@ -62,7 +63,10 @@ GitOps PR   = reviewed desired-state change
 dependency  = versioned contract between repositories
 sync        = duplicated files maintained by automation
 polling     = consumer periodically compares upstream state
+external    = repository input observed by an App/service-side control plane
 ```
+
+For an external integration, a folder such as `deploy/orders/` is only source input. An App-authored check or comment proves detection; merge to the configured publication branch is the hand-off; the service then reconciles the mapped artifact into runtime. Record the administrator, connection name, watched repository/path, source-to-runtime identifier mapping, and runtime query. Treat watched branch and webhook-versus-polling behavior as `unknown` until the service administration page proves them. See [Reverse-Engineering External Repository Integrations](07_external_repository_integrations.md) for the full evidence procedure.
 
 > **Key insight**: Prefer a versioned artifact or explicit contract over a dependency on "whatever is currently on another repository's main branch."
 
@@ -78,7 +82,7 @@ For cross-repository automation, prefer:
 2. a fine-grained personal access token when an app is not practical;
 3. a classic personal access token only for legacy compatibility.
 
-> **Core:** every pattern in this note needs a credential broader than the default `GITHUB_TOKEN`. Which kind — GitHub App, fine-grained PAT, classic PAT — is a detail; that some non-default credential exists is not optional.
+> **Core:** explicit cross-repository API or Git operations need destination authority broader than the source repository's default `GITHUB_TOKEN`. A permitted private reusable workflow is downloaded with a GitHub-provided scoped token, and polling a public producer needs no private-repository authority. For private reusable workflows, the central repository administrator must enable Actions access for the caller organization/repositories; a disallowed caller sees `workflow was not found`.
 
 Endpoint permission requirements differ:
 
@@ -146,7 +150,7 @@ jobs:
       # Pin this action to a reviewed full commit SHA in production.
       - name: Create a destination-scoped installation token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.CICD_APP_CLIENT_ID }}
           private-key: ${{ secrets.CICD_APP_PRIVATE_KEY }}
@@ -225,7 +229,7 @@ jobs:
       # Pin this action to a reviewed full commit SHA in production.
       - name: Create a source-repository verification token
         id: source-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.CICD_APP_CLIENT_ID }}
           private-key: ${{ secrets.CICD_APP_PRIVATE_KEY }}
@@ -263,6 +267,8 @@ jobs:
 The payload is a request, not proof: validate the envelope's schema, actor, and source above, then verify the certificate's workflow, ref, and commit independently — one check is not a substitute for the other. Replace the illustrative `acme-cicd[bot]` slug with the installed app's actual actor.
 
 The receiving `repository_dispatch` workflow must exist on the destination's default branch.
+
+A `202` with no run means the hand-off failed after acceptance: the receiver may be absent from the default branch, `types` may not match `release_candidate_published`, or the App installation may not cover the destination. Only a destination run URL and status close that evidence gap.
 
 ---
 
@@ -508,6 +514,18 @@ This makes the relationship explicit:
 shared-contract = "2.4.1"
 ```
 
+The complete local carrier includes all five boundaries:
+
+```text
+producer metadata:  name=shared-contract version=2.4.1 schema_digest=sha256:91ab...
+registry result:    shared-contract@2.4.1 published, immutable digest sha256:91ab...
+consumer lock:      shared-contract = "2.4.1"; integrity = "sha256:91ab..."
+updater PR:         2.4.1 → 2.5.0; producer/consumer compatibility suite = PASS
+deprecation:        2.x supported through 2027-03-31; removal requires 3.0.0
+```
+
+The producer owns publication and backward-compatibility policy; the consumer owns adoption. Without registry publication evidence and the updater's effective configuration, this is an architectural proposal, not proof of an existing binding. [Cross-Repository Contract Lifecycle](08_cross_repository_contract_lifecycle.md) owns the complete publish-to-deprecation walkthrough.
+
 It is normally safer than copying the current source from Repo A.
 
 ---
@@ -532,7 +550,11 @@ central policy repository
     ↓ open or update a deterministic bot branch
 destination pull request
     ↓ normal review and required checks
+    ↓ merge to configured publication branch
+destination/runtime reports consumed rendered digest
 ```
+
+Write down the synchronization contract: `acme/policy` is canonical; `templates/dependabot.yml` renders `.github/dependabot.yml`; the bot watches `main` and that path; `acme-policy-sync[bot]` opens or updates branch `automation/policy-sync`; required checks validate compatibility; after merge, the destination reports the rendered checksum it loaded. A detected diff proves only that the bot noticed a mismatch. The merged checksum and independent destination/runtime observation prove consumption.
 
 Prefer reusable workflows and versioned packages where possible. Synchronization creates copies, and copies drift.
 
@@ -592,4 +614,4 @@ Cannot modify producer?
 
 ---
 
-**Next**: [Performance and Reliability](06_performance_and_reliability.md)
+**Next**: [Reverse-Engineering External Repository Integrations](07_external_repository_integrations.md)

@@ -76,6 +76,15 @@ The delivery contract should answer:
 | Did the release work? | Health, smoke, synthetic, and business signals |
 | How do we recover? | Previous digest, compatible data, and a tested procedure |
 
+The evidence does not all live in Git. Keep an evidence map so a checked-in declaration is not mistaken for an enforced control:
+
+| Claim | Owner and authoritative inspection surface | Repository proves | Unknown without control-plane access | Proof it acted |
+|---|---|---|---|---|
+| `required-ci` validates the candidate | Repository; `.github/workflows/ci.yml` | Trigger, job graph, and declared check name | Which active GitHub ruleset targets `main`, its source restriction, and bypass actors | A deliberately failing PR produces a red `required-ci` from the expected GitHub App and GitHub blocks merge |
+| Production requires approval | GitHub environment administrator; environment settings/API | The deploy job names `environment: production` | Reviewer list, allowed refs, custom gates, self-review, and admin bypass | An unapproved run remains waiting and receives no production credential |
+
+Record inaccessible fields as `unknown`; repository silence is not evidence that an external control is absent or correctly configured.
+
 *Synthetic* signals here mean scripted requests that continuously exercise key user journeys — placing an order, logging in — independent of real traffic, so a broken flow is caught even during a quiet period.
 
 > **Key insight**: A green workflow only proves that its declared commands exited successfully. The pipeline is trustworthy only when those commands produce the evidence the business risk requires.
@@ -223,10 +232,10 @@ The sequence below is how the column-drop failure above gets avoided: it never l
 ```text
 expand schema
     → deploy code compatible with old and new schema
-    → backfill
+    → backfill (copy existing rows into the new representation in bounded batches)
     → switch reads
     → observe
-    → contract schema in a later release
+    → contract schema in a later release (remove the old field only after no old binary needs it)
 ```
 
 **Success signal:** at every phase, the previous release's code keeps running correctly against the current schema — you could pause between phases indefinitely without an outage. **Silent-failure tell:** a migration that looks clean in the deploy log but starts erroring only after autoscaling replaces the last old pod — evidence the expand phase was never actually backward-compatible, just untested against overlap.

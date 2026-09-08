@@ -116,9 +116,9 @@ Use when:
 
 Control:
 
-- maximum unavailable capacity;
-- maximum surge;
-- readiness and startup probes;
+- **★ maximum unavailable capacity;**
+- **★ maximum surge;**
+- **★ readiness and startup probes;**
 - connection draining;
 - deployment timeout;
 - platform circuit breaker;
@@ -171,10 +171,10 @@ candidate traffic:
 
 Each arrow holds for a **bake** — the fixed observation window described above, held after every traffic step — before the controller evaluates and either widens exposure or stops.
 
-Choose canary signals before rollout:
+Choose canary signals before rollout; start with the starred request-health signals:
 
-- request error rate by version;
-- latency percentiles by version;
+- **★ request error rate by version;**
+- **★ latency percentiles by version;**
 - saturation and restarts;
 - dependency errors;
 - business conversions or rejected operations;
@@ -192,6 +192,11 @@ for weight in 5 25 50 100; do
     --service orders \
     --digest "$IMAGE_DIGEST" \
     --percent "$weight"
+
+  effective_weight="$(./scripts/get-canary-weight.sh --service orders --digest "$IMAGE_DIGEST")"
+  measured_share="$(./scripts/get-candidate-request-share.sh --service orders --minutes 5)"
+  test "$effective_weight" = "$weight"
+  ./scripts/assert-share-near.sh "$measured_share" "$weight" --tolerance-percent 3
 
   ./scripts/verify-canary-window.sh \
     --service orders \
@@ -223,7 +228,7 @@ candidate requests observed:  0
 decision: HALT  (no candidate telemetry in the window — missing data is treated as failure, not as a clean signal)
 ```
 
-Those scripts must query version-segmented metrics, handle low traffic, and stop or roll back when data is missing. "No metrics" is not success.
+After every write, the controller reconciles desired weight, control-plane-reported effective weight, and measured candidate request share. A mismatch or inaccessible inspection surface is `unknown` and halts before health evaluation. The scripts must query version-segmented metrics, handle low traffic, and stop or roll back when data is missing. "No metrics" is not success.
 
 AWS ECS canary deployments support a small initial traffic shift followed by full traffic, bake time, lifecycle hooks, and alarm-driven rollback. Other platforms and progressive-delivery controllers support more steps and cohort strategies.
 
@@ -244,20 +249,33 @@ Classify flags:
 
 Operational rules:
 
-- safe default when the flag service is unavailable;
-- audit changes and restrict production write access;
-- include flag state in deployment and incident context;
-- test important on/off combinations;
+- **★ safe default when the flag service is unavailable;**
+- **★ audit changes and restrict production write access;**
+- **★ include flag state in deployment and incident context;**
+- **★ test important on/off combinations;**
 - cache with bounded staleness;
 - remove release flags after full adoption.
+
+An externally managed flag needs its own versioned carrier:
+
+```yaml
+key: checkout_v2
+version: 184
+owner: team-checkout
+safe_default: false
+targeting: { cohort: internal-users, value: true }
+remove_after: 2026-11-30
+```
+
+The deployment record stores `checkout_v2@184`. A request with cohort `internal-users` must report `flag.checkout_v2=true` and `flag_config_version=184` in correlated telemetry; a repository copy alone cannot prove the flag service applied or evaluated that version.
 
 A flag controls which code path runs; it has no say over what shape the data underneath is in. Say a migration changes a column's format, and either an old instance that hasn't redeployed yet, or any request routed to a cohort where the flag is still off, reads a row the new code already wrote. The flag never touches that instance's code — it still runs the old parser — and the row is now in a shape that parser cannot read, so the request fails or misreads data regardless of what the flag is set to. Hiding an incompatible schema migration behind a feature flag doesn't make the migration compatible; it just guarantees that some cohort hits the incompatible shape while believing the flag protected them.
 
 ---
 
-## 7. Shadow Traffic Tests Candidates With Zero User-Facing Risk
+## 7. Shadow Traffic Removes Response Exposure Only When Side Effects Are Suppressed
 
-> **Edge case:** reach for shadowing only when you need production-realistic input with zero chance of affecting a real user. Most changes are better served by canary, which does expose users, but under a controlled and reversible slice.
+> **Edge case:** reach for shadowing only when you need production-realistic input and can suppress emails, payments, writes, and every other side effect. It removes candidate responses from the user path; it does not make execution harmless by itself. Most changes are better served by canary, which does expose users, but under a controlled and reversible slice.
 
 Shadowing sends a copy of production requests to a candidate but ignores its response:
 
@@ -322,11 +340,11 @@ Roll forward when:
 
 Always retain:
 
-- previous artifact digest and task definition;
-- release manifest and [configuration version](05_configuration_versioning_and_recovery.md);
-- traffic-routing state;
+- **★ previous artifact digest and task definition;**
+- **★ release manifest and [configuration version](05_configuration_versioning_and_recovery.md);**
+- **★ traffic-routing state;**
 - flag state;
-- migration compatibility window.
+- **★ migration compatibility window.**
 
 > **Key insight**: rollout strategy — rolling, blue-green, canary, shadow — only ever limits how many compute instances or users are exposed to a bad version. Whether rollback is actually safe is decided somewhere else entirely: by whether data and protocol compatibility still hold between the previous version and whatever the new one already wrote.
 

@@ -9,9 +9,11 @@ A repo that pins every action to a SHA and every base image to a digest still dr
 **What you need (4 things):**
 
 1. An update-tool config (`dependabot.yml` or Renovate's `renovate.json`) that watches your ecosystems and groups routine bumps.
-2. A workflow step that reads the proposed update's semver bump type and only *enables* auto-merge for the low-risk tier — it never merges outright.
+2. A workflow step that reads the proposed update's **Semantic Versioning (semver)** major/minor/patch classification and only *enables* auto-merge for the low-risk tier — it never merges outright.
 3. A branch ruleset that requires the same status checks for every actor, with no bypass entry for the bot's own account.
-4. A scheduled check (or the update tool's own alerting) that flags a pin whose age crosses a threshold with no update proposed.
+4. A scheduled age heuristic plus upstream-release and open-PR lookup that distinguishes an old-but-current pin from a genuinely blocked update.
+
+The repository administrator must also enable the externally owned **Allow auto-merge** setting. Inspect it with `gh api repos/acme/orders --jq .allow_auto_merge`; `true` is the prerequisite. When disabled, `gh pr merge --auto` fails even though every checked-in file is correct.
 
 **The code:**
 
@@ -38,7 +40,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh pr merge --auto --squash "${{ github.event.pull_request.html_url }}"
 ```
-**Success signal:** a patch or minor Dependabot PR shows "This pull request will be merged automatically once required checks pass" in its merge box, then merges on its own the moment `required-ci` turns green — no reviewer opened the diff. A major-version PR gets no such message: the `if:` condition never matched, so it sits exactly where a human-authored major bump would.
+**Success signal:** a patch or minor Dependabot PR shows "This pull request will be merged automatically once required checks pass" in its merge box, then merges on its own the moment `required-ci` turns green — no reviewer opened the diff. A major-version PR gets no such message: the `if:` condition never matched, so it sits exactly where a human-authored major bump would. **Failure tell:** `GraphQL: Pull request Auto merge is not allowed for this repository` means the repository setting is disabled; it is not a CI failure.
 
 **Not handled yet:** [routing major bumps, new sources, and first-time pins to mandatory review](#2-tier-the-pr-by-what-actually-changed-not-who-opened-it), [closing the bypass-list hole that lets a bot skip required checks](#3-the-required-ci-gate-has-no-bot-exception), [an expedited path for a CVE against a pin already in production](#4-a-cve-against-a-pinned-dependency-gets-a-clock-not-a-shortcut), and [catching a pin that just aged out with no CVE and no proposed update](#5-staleness-has-no-alert-by-default-so-you-have-to-build-one).
 
@@ -116,8 +118,9 @@ Each `groups` block bundles same-tier updates into one PR — fewer PRs to revie
 
 Say a team, tired of Dependabot PRs blocking on a slow integration suite, adds `dependabot[bot]` to the repository ruleset's bypass list — GitHub's rulesets let you name an actor, including a bot, that skips the ruleset's protections entirely when it opens or merges a PR. An attacker who compromises an upstream package's publish pipeline — the same phished-token or hijacked-release-job attack [Workflow and Runner Hardening](02_workflow_and_runner_hardening.md#2-only-a-full-commit-sha-actually-pins-an-action) already walked through for actions — ships a malicious "patch" release. Dependabot's classifier sees a patch bump and proposes it exactly as designed. Because the bypass list skips required checks for this actor, the PR merges the moment it opens: no test run, no scan, nothing between the malicious patch and production.
 
+Unsafe explanatory excerpt from the repository ruleset API — the bot bypasses checks:
+
 ```json
-// ❌ Bypass list includes the update bot — its PRs skip required checks entirely
 {
   "bypass_actors": [
     { "actor_id": 12345, "actor_type": "Integration", "bypass_mode": "always" }
@@ -125,24 +128,41 @@ Say a team, tired of Dependabot PRs blocking on a slow integration suite, adds `
 }
 ```
 
+Safe explanatory excerpt — no bot bypass:
+
 ```json
-// ✅ No bypass entry for any bot — Dependabot's PRs answer to the same ruleset as a human's
 {
   "bypass_actors": []
 }
 ```
 
+The repository or organization ruleset administrator owns the effective value. Query every active ruleset targeting `main` and confirm `bypass_actors` is empty for update bots and the `required_status_checks` entry names `required-ci` plus its expected source App. A merged Dependabot PR with no `required-ci` check on its commit proves the effective configuration drifted.
+
 Point the ruleset's required-status-check setting at the same `required-ci` aggregator this collection already uses for human PRs — see [Harden the Required Check So a Skipped Job Cannot Pass It](../01_fundamentals/03_testing_and_quality_gates.md#3-harden-the-required-check-so-a-skipped-job-cannot-pass-it). A Dependabot PR satisfies that aggregator by making `lint`, `unit`, and every other upstream job actually run and succeed on its exact commit — not by the ruleset recognizing a bot actor and waiving the requirement. `gh pr merge --auto` in the short version's workflow only *enables* auto-merge; GitHub's own documentation is explicit that the option exists for PRs that "can't merge immediately" and defers the merge until required checks and reviews are satisfied — it is not a second path around the ruleset.
 
 ⚠️ The failure above leaves no error message, because nothing failed — the bypass list did exactly what it was configured to do. The tell is in the PR's own timeline, not in any command's exit code: open a merged Dependabot PR and check whether a `required-ci` check run exists on that commit at all. No entry there, on a PR that merged anyway, means required checks were bypassed or never configured on the branch — whether or not the auto-merge workflow "ran" is beside the point.
 
-A repository already running a **merge queue** — GitHub's temporary environment where several merge candidates are re-validated together right before landing, described in [Approved Doesn't Mean Safe Until It's Tested Against Today's `main`](../01_fundamentals/02_branching_and_change_control.md#5-approved-doesnt-mean-safe-until-its-tested-against-todays-main) — doesn't need a different mechanism here: `gh pr merge --auto` adds the PR to that same queue instead of merging it directly, and the queue's own re-test against the latest `main` still runs before it lands.
+A repository already running a **merge queue** — GitHub's temporary environment where candidates are re-validated together — needs a different credential for explicit queue admission: the built-in `GITHUB_TOKEN` cannot add a PR to the queue. Mint a token from a narrowly installed GitHub App and pass it as `GH_TOKEN` to `gh pr merge --auto --squash "$PR_URL"`. The App installation covers `orders` only; queue admission succeeds there and returns `404` or authorization denial against a repository outside the installation. The queue still re-tests the candidate against the latest `main` before it lands.
+
+```yaml
+- id: app-token
+  uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+  with:
+    client-id: ${{ vars.UPDATE_APP_CLIENT_ID }}
+    private-key: ${{ secrets.UPDATE_APP_PRIVATE_KEY }}
+    owner: acme
+    repositories: orders
+- env:
+    GH_TOKEN: ${{ steps.app-token.outputs.token }}
+    PR_URL: ${{ github.event.pull_request.html_url }}
+  run: gh pr merge --auto --squash "$PR_URL"
+```
 
 ---
 
 ## 4. A CVE Against a Pinned Dependency Gets a Clock, Not a Shortcut
 
-None of the tiering in section 2 fires from a version-bump signal when the update exists because of a vulnerability, not a release — a semver classifier has no way to know a patch release closes a CVE, and it shouldn't have to. Dependabot security updates and Renovate's `vulnerabilityAlerts` are a separate trigger, matched against a security advisory rather than against a new upstream release, and they behave differently from routine version updates once they fire. GitHub's own docs state there is no interaction between `dependabot.yml` and Dependabot security alerts beyond one thing: merging the security PR closes the alert it addresses — so a security-update PR isn't shaped by your `schedule.interval` or your `open-pull-requests-limit` at all, and GitHub explicitly excludes security-update PRs from that limit. Renovate's equivalent is more direct about it: its docs describe `vulnerabilityAlerts` PRs as ones that "skip the line," ignoring `schedule`, `prConcurrentLimit`, and `prHourlyLimit` outright rather than reading an overridden value for any of them.
+None of the tiering in section 2 fires from a version-bump signal when the update exists because of a vulnerability, not a release — a semver classifier has no way to know a patch release closes a **Common Vulnerabilities and Exposures (CVE)** identifier. Advisory detection and timing come from Dependabot security alerts, not the routine version schedule. `dependabot.yml` can still shape the resulting security-update PR through groups using `applies-to: security-updates`; those groups are configured on the default branch, and a non-default `target-branch` changes which version-update configuration applies. GitHub excludes security-update PRs from the routine open-PR limit. Renovate's `vulnerabilityAlerts` similarly takes an expedited path.
 
 ```json
 {
@@ -197,12 +217,12 @@ jobs:
             commit_date=$(gh api "repos/${repo}/commits/${sha}" --jq '.commit.committer.date')
             age_days=$(( (now_epoch - $(date -u -d "$commit_date" +%s)) / 86400 ))
             if (( age_days > max_age_days )); then
-              echo "::warning::${repo}@${sha} is ${age_days} days old with no update proposed"
+              echo "::warning::${repo}@${sha} is ${age_days} days old; age alone does not prove an update exists"
             fi
           done
 ```
 
-`GH_TOKEN` here only needs to read public commit metadata on whatever repositories your `uses:` lines reference, which the default `GITHUB_TOKEN` already covers. The same pattern extends to base-image digests by walking `Dockerfile` lines instead of workflow files, and to package pins by comparing a lockfile's pinned version against the registry's latest release date for that package.
+This is an age-only heuristic: an old-but-current pin and an old pin blocked behind an update PR both warn. To claim proposal staleness, also query the upstream trusted release and the repository's open Dependabot/Renovate PRs. Report `old but current` when the pinned SHA equals the latest trusted release, and `blocked update` only when a newer trusted release exists and an open or failed update PR names it. `GH_TOKEN` here only needs to read public commit metadata on referenced repositories. The same pattern extends to base-image and package pins only when their registries are queried too.
 
 > **Production:** run this on a schedule, not as a manual audit — a threshold nobody checks is not a threshold. Route its warnings into whatever already tracks the CVE fast lane in section 4, so a stale pin becomes a ticket with an owner instead of a log line nobody reads. If you're already on Renovate, its optional `dependencyDashboard` config gives you a lower-effort version of this: one continuously updated issue listing every pending, rate-limited, or otherwise blocked update, instead of a script you maintain yourself.
 

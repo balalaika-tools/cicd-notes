@@ -8,8 +8,8 @@ A deployment API call can return success while the new code never serves a singl
 
 **What you need (3 things):**
 
-1. A readiness endpoint that reports the running release (`commit` or `image_digest`), not just `"status": "ok"`.
-2. The commit the pipeline expects to be running, so the check has something to compare against.
+1. A readiness endpoint that reports the immutable `image_digest`, with commit retained only as diagnostic metadata.
+2. The digest the pipeline promoted, so the check compares exact bytes rather than a source revision that may have been built more than once.
 3. One request against a real dependency-backed path, since a process can be "ready" while its database or queue connection is broken.
 
 **The code:**
@@ -18,23 +18,23 @@ A deployment API call can return success while the new code never serves a singl
 #!/usr/bin/env bash
 set -euo pipefail
 
-base_url="${1:?usage: smoke.sh BASE_URL EXPECTED_COMMIT}"
-expected_commit="${2:?usage: smoke.sh BASE_URL EXPECTED_COMMIT}"
+base_url="${1:?usage: smoke.sh BASE_URL EXPECTED_DIGEST}"
+expected_digest="${2:?usage: smoke.sh BASE_URL EXPECTED_DIGEST}"
 
 health_json="$(curl --connect-timeout 5 --max-time 20 --fail --silent --show-error "$base_url/health/ready")"
-actual_commit="$(jq -er '.commit' <<< "$health_json")"
+actual_digest="$(jq -er '.image_digest' <<< "$health_json")"
 
-if [[ "$actual_commit" != "$expected_commit" ]]; then
-  echo "FAIL: /health/ready reports commit ${actual_commit}, expected ${expected_commit}" >&2
+if [[ "$actual_digest" != "$expected_digest" ]]; then
+  echo "FAIL: /health/ready reports digest ${actual_digest}, expected ${expected_digest}" >&2
   echo "  (instance is healthy but running a different release)" >&2
   exit 1
 fi
 
 curl --connect-timeout 5 --max-time 20 --fail --silent --show-error "$base_url/api/v1/catalog?limit=1" > /dev/null
-echo "OK: serving commit ${actual_commit}, representative request succeeded"
+echo "OK: serving digest ${actual_digest}, representative request succeeded"
 ```
 
-**Success signal:** `OK: serving commit <expected_commit>, representative request succeeded` on stdout, exit code `0`.
+**Success signal:** `OK: serving digest <expected_digest>, representative request succeeded` on stdout, exit code `0`.
 
 **Not handled yet:** [gating a progressive rollout on telemetry](#5-an-absolute-threshold-fails-at-normal-peak-and-passes-during-a-quiet-outage), [proving a rollback target is actually eligible](#7-a-rollback-that-trusts-its-own-input-can-redeploy-the-wrong-or-revoked-artifact), [recovering from a data-incompatible release](#6-recovery-is-a-decision-tree-not-a-single-rollback-button), and [measuring the delivery system without gaming it](#9-measure-the-system-not-the-people-running-it).
 
@@ -70,6 +70,18 @@ business behavior remains healthy
 | API | Representative authenticated and unauthenticated requests |
 | Service | Error, latency, traffic, saturation, SLO burn |
 | Business | Orders accepted, jobs completed, payments authorized |
+
+Reconcile the same identity across owners instead of trusting the application alone:
+
+```text
+release manifest (pipeline owner)       expected digest = sha256:4ae0...9c1d
+platform task/pod (platform owner)      resolved digest = sha256:4ae0...9c1d
+serving /health response (service)      observed digest = sha256:4ae0...9c1d
+trace for request smoke-8912 (telemetry) release.digest = sha256:4ae0...9c1d
+decision                                MATCH
+```
+
+If any inspection surface is inaccessible, the decision is `unknown`, not success. The request-correlated trace proves the instance reporting the digest also handled the representative request.
 
 A **service-level objective (SLO)** is the reliability target you've committed to for a signal — for example, 99.9% of requests succeeding within 300ms over a rolling 28 days. Its **burn rate** is how fast that commitment's failure budget is being spent: a burn rate of 10x means the whole month's allowed failure budget would be gone in about three days if the current error rate held. A deployment can look healthy on every layer above and still be burning SLO budget fast — the business layer just hasn't caught up to the damage yet.
 
@@ -178,6 +190,8 @@ Send a deployment event containing:
   "actor": "cicd-app[bot]"
 }
 ```
+
+Here **ECS** means Amazon Elastic Container Service; the service deployment identifier lets an operator query rollout state, task failures, and the resolved task definition in AWS's control plane.
 
 Add release identity to logs, traces, metrics, and error reports. During an incident, responders should be able to move from a latency spike to the deployment and then to its source and artifact.
 
@@ -304,7 +318,7 @@ jobs:
           echo "digest=$target" >> "$GITHUB_OUTPUT"
 
       - name: Assume production deploy role
-        uses: aws-actions/configure-aws-credentials@v4 # pin to a full commit SHA in production; a tag is shown for readability
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
           role-to-assume: arn:aws:iam::111111111111:role/orders-production-deploy
           aws-region: us-east-1
@@ -329,11 +343,23 @@ jobs:
         run: ./scripts/verify-environment.sh production
 ```
 
-`resolve-rollback-target.sh` owns the eligibility check described in the comment above: it walks the retained deployment record back to the nearest prior entry and refuses to hand back anything revoked, data-incompatible, or non-adjacent. That is what turns "any attested digest" into "the digest this incident is actually allowed to roll back to" — the workflow never sees a digest that hasn't already passed that check.
+`resolve-rollback-target.sh` owns the eligibility check described in the comment above: it walks the retained deployment record back to the nearest prior entry and refuses to hand back anything revoked, data-incompatible, or non-adjacent. Its durable append-only source exposes records shaped like:
+
+```json
+{"record_id":"dep-0194","environment":"production","digest":"sha256:new...","previous_digest":"sha256:good...","revoked":false,"schema_compatible_back_to":"sha256:good...","verified_at":"2026-09-08T12:00:00Z","writer":"orders-deploy-role/run-8912"}
+```
+
+Input `current=sha256:new...` selects adjacent `sha256:good...` because it is unrevoked and schema-compatible. Change only `revoked` to `true`, or set the compatibility boundary past that predecessor, and resolution refuses it. Skipping farther back requires a reviewed exception rather than an operator-supplied digest.
 
 `--signer-workflow` is what makes the attestation check mean something. `--repo acme/orders` alone only proves *some* workflow in that repository produced the attestation — including a test, maintenance, or otherwise-compromised workflow with just enough permissions to sign, which still satisfies repo scope. Pinning `--signer-workflow acme/orders/.github/workflows/build-and-attest.yml@refs/heads/main` narrows trust from "came from this repository" to "came from this specific, reviewed build pipeline" ([gh attestation verify](https://cli.github.com/manual/gh_attestation_verify), checked 2026-08-14).
 
 `configure-aws-credentials` is the **OIDC** (OpenID Connect — a federated identity protocol layered on OAuth 2.0) exchange this job depends on: GitHub issues the running job a short-lived token asserting its exact repository, workflow, and environment identity, and the pinned action trades that token for temporary AWS credentials scoped to the `orders-production-deploy` role. Nothing long-lived is stored in GitHub, and the trust policy on that IAM role — not this workflow file — is what actually restricts which workflows may assume it.
+
+The cloud security owner inspects the live role with `aws iam get-role`; its condition binds `aud=sts.amazonaws.com` and `sub=repo:acme/orders:environment:production`. The approved repository/workflow/ref/environment succeeds; changing a bound claim returns `AccessDenied`. Store the reviewed policy digest and alert when the live query differs, because workflow YAML cannot prove cloud trust.
+
+```json
+{"StringEquals":{"token.actions.githubusercontent.com:aud":"sts.amazonaws.com","token.actions.githubusercontent.com:sub":"repo:acme/orders:environment:production"}}
+```
 
 Recovery workflows deserve the same identity, environment, and approval controls as normal releases; rollback is still a production deployment.
 
@@ -375,15 +401,17 @@ Attach any of these to a person's or a team's name and two things go wrong. Firs
 
 > **Rule**: Use them to improve the system, not rank individuals.
 
-Also track:
+Start with the three starred system measures; add the conditional ones when they answer a real bottleneck. Also track:
 
-- PR first-feedback and merge time;
-- queue and critical-path duration;
-- flaky-test rate;
+- **★ PR first-feedback and merge time;**
+- **★ queue and critical-path duration;**
+- **★ flaky-test rate;**
 - deployment approval wait;
 - rollback test success;
 - percentage of deployments with provenance and known previous digest;
 - preview-environment leakage and CI cost.
+
+Example: the 30-day p95 queue duration rises from 2 to 11 minutes while execution stays flat at 6 minutes. The team adds runner capacity rather than rewriting tests; the following week's queue p95 returns below 3 minutes. The measure leads to a system change, not a team ranking.
 
 Smaller batch size often improves both throughput and recovery.
 

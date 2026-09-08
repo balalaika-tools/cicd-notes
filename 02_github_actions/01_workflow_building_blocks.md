@@ -32,7 +32,9 @@ jobs:
 
 **Success signal:** Opening a pull request shows a "Hello Check / greet" check that turns green within a few seconds; its step log contains `Hello from Actions`.
 
-**Not handled yet:** [running matrix variations in one job](#1-a-workflow-needs-only-one-event-one-job-one-step), [validating merge-queue candidates](#2-the-event-you-choose-sets-the-runs-trust-boundary), [narrowing what the run's token can do](#6-each-context-has-one-safe-use-and-one-trap), [limiting overlapping runs](#8-environments-and-concurrency-are-independent), and [caching dependencies](#7-artifacts-caches-and-registries-are-not-interchangeable).
+Save the file under `.github/workflows/<name>.yml`; GitHub does not discover workflow YAML elsewhere. If no check appears, inspect the Actions page: a misplaced file creates no workflow at all, while invalid YAML is reported as an invalid-workflow error and creates no runnable check.
+
+**Not handled yet:** [running a matrix—one job definition expanded across several input combinations](#1-a-workflow-needs-only-one-event-one-job-one-step), [validating merge-queue candidates—temporary combined revisions GitHub tests before merging](#2-the-event-you-choose-sets-the-runs-trust-boundary), [narrowing what the run's `GITHUB_TOKEN`—the short-lived repository credential GitHub injects into a job—can do](#6-each-context-has-one-safe-use-and-one-trap), [limiting overlapping runs](#8-environments-and-concurrency-are-independent), and [caching dependencies](#7-artifacts-caches-and-registries-are-not-interchangeable).
 
 ---
 

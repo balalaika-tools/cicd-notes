@@ -1,6 +1,6 @@
 # Provisioning the Reference Platform
 
-> **Who this is for**: Engineers standing up the AWS and GitHub resources the end-to-end production example assumes already exist — the ECR repository, the staging and production ECS clusters and services, the three per-environment OIDC deployment roles, and the first task-definition revision.
+> **Who this is for**: Engineers standing up the AWS resources the end-to-end production example assumes — ECR, ECS clusters/services, deployment roles, and the first task-definition revision. GitHub environments and rulesets remain separate administrator-owned prerequisites.
 
 ## The short version
 
@@ -20,7 +20,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
   }
 }
@@ -40,6 +40,15 @@ output "repository_uri" {
 
 **Success signal:** `terraform apply` prints `Apply complete! Resources: 1 added, 0 changed, 0 destroyed`, and the `repository_uri` output reads `123456789012.dkr.ecr.eu-west-1.amazonaws.com/orders` — the exact registry string the release workflow in the end-to-end example already pushes to.
 
+Before applying the full platform, identify the external bootstrap boundaries:
+
+| Input/control | Owner/source of truth | Verification |
+|---|---|---|
+| Terraform bootstrap role | AWS landing-zone owner; live IAM policy | `aws sts get-caller-identity` returns account `123456789012` and the approved provisioner role |
+| Existing network IDs | Network team; VPC inventory/remote state | each subnet and security group resolves in `eu-west-1` and belongs to the intended VPC |
+| GitHub account OIDC provider | Cloud security owner; IAM OIDC-provider API | issuer/audience match GitHub; positive and negative assumption tests pass |
+| GitHub environments/rulesets | Repository/organization admin; GitHub settings/API | protected-ref deploy succeeds; unprotected ref and bypass attempt are refused |
+
 **Not handled yet:** [expiring images nobody promoted](#hardening-expire-what-nobody-promoted), [the two ECS clusters and the `orders` service in each](#2-two-ecs-clusters-and-the-orders-service-each-one-deploys), [the three IAM roles that push and deploy](#3-three-iam-roles-creating-the-resource-not-the-trust-boundary), and [the first task-definition revision](#4-task-definition-revision-1-before-183-can-exist).
 
 ---
@@ -56,31 +65,14 @@ For how this Terraform actually gets reviewed and applied — speculative plans,
 
 The baseline repository keeps every image forever. A build that never gets promoted — a failed PR-triggered rebuild, an abandoned branch's release attempt — still leaves a layer set sitting in ECR, and storage cost grows with every commit to `main`, not just every release. An **ECR lifecycle policy** — a set of rules ECR evaluates on a schedule to expire images automatically — bounds that without deleting anything a task definition still points to:
 
-```hcl
-resource "aws_ecr_lifecycle_policy" "orders" {
-  repository = aws_ecr_repository.orders.name
+ECR lifecycle rules cannot express "delete only when no active task definition references this digest." Use a scheduled reconciler: list tagged images older than 14 days, enumerate task definitions and active services, resolve every referenced digest, and delete only the set difference after a reviewed retention window.
 
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Expire untagged images after 14 days"
-        selection = {
-          tagStatus   = "untagged"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 14
-        }
-        action = { type = "expire" }
-      }
-    ]
-  })
-}
+```text
+git-deadbeef → sha256:abandoned  age=31d  active references=0                     → EXPIRE
+git-a1b2c3d  → sha256:deployed   age=45d  active references=production/orders:184 → RETAIN
 ```
 
-> **Production:** this rule only ever matches images with zero tags pointing at them — every image this pipeline pushes keeps its `git-<sha>` tag for good, so nothing the pipeline produces is ever "untagged." [§5](#5-what-breaks-first-and-when-not-to-provision-this-way) covers what happens if a later rule is written more broadly.
-
-**How you know it's working:** `aws ecr get-lifecycle-policy --repository-name orders` returns the JSON above. The silent failure is applying a lifecycle policy to the wrong repository name after a rename — Terraform reports success either way, since `aws_ecr_lifecycle_policy` only checks that some repository by that name exists, not that it's the one you meant.
+The registry/platform owner publishes this signed report before deletion. A candidate with an inaccessible reference inventory is `unknown` and retained; storage cost is safer than deleting a rollback or running subject.
 
 ---
 
@@ -102,7 +94,31 @@ resource "aws_ecs_cluster" "this" {
 
 Each cluster gets one `orders` service, sized as a starting baseline rather than a production target — one task, on **Fargate** (AWS's serverless compute for containers; no EC2 instance to patch or size):
 
+The required inputs are typed and validated. A **VPC** (Virtual Private Cloud) is the AWS network whose subnets and security groups receive these tasks:
+
 ```hcl
+variable "subnet_ids" {
+  type = list(string)
+  validation {
+    condition     = length(var.subnet_ids) >= 2 && alltrue([for id in var.subnet_ids : can(regex("^subnet-[0-9a-f]+$", id))])
+    error_message = "Provide at least two subnet IDs."
+  }
+}
+variable "security_group_ids" {
+  type = list(string)
+  validation {
+    condition     = length(var.security_group_ids) > 0 && alltrue([for id in var.security_group_ids : can(regex("^sg-[0-9a-f]+$", id))])
+    error_message = "Provide at least one security-group ID."
+  }
+}
+variable "bootstrap_image_digest" {
+  type = string
+  validation {
+    condition     = can(regex("^sha256:[0-9a-f]{64}$", var.bootstrap_image_digest))
+    error_message = "Provide the pushed bootstrap image digest."
+  }
+}
+
 resource "aws_ecs_service" "orders" {
   for_each        = aws_ecs_cluster.this
   name            = "orders"
@@ -292,7 +308,18 @@ resource "aws_iam_role_policy_attachment" "execution" {
 }
 ```
 
-Revision 1 itself, registered with family `orders` and container `orders` — the exact two names `register-task-definition.sh` later takes as its `$1` and `$2` arguments — pointing at a `:bootstrap` tag pushed by hand once, before any pipeline exists to push `git-<sha>` tags:
+Publish the bounded bootstrap image before `terraform apply`, then pass the returned digest as `bootstrap_image_digest`:
+
+```bash
+aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.eu-west-1.amazonaws.com
+docker build -t orders-bootstrap:local .
+docker tag orders-bootstrap:local 123456789012.dkr.ecr.eu-west-1.amazonaws.com/orders:bootstrap
+docker push 123456789012.dkr.ecr.eu-west-1.amazonaws.com/orders:bootstrap
+```
+
+Record the pushed `sha256:...`; after apply, `aws ecs wait services-stable --cluster staging --services orders` must succeed. Repeated `CannotPullContainerError` means the digest was not published or the execution role cannot pull it.
+
+Revision 1 itself is registered with family `orders` and container `orders`, pointing at that immutable bootstrap digest:
 
 ```hcl
 resource "aws_cloudwatch_log_group" "orders" {
@@ -310,7 +337,7 @@ resource "aws_ecs_task_definition" "orders" {
 
   container_definitions = jsonencode([{
     name      = "orders"
-    image     = "${aws_ecr_repository.orders.repository_url}:bootstrap"
+    image     = "${aws_ecr_repository.orders.repository_url}@${var.bootstrap_image_digest}"
     essential = true
     portMappings = [
       { containerPort = 8080, protocol = "tcp" }
@@ -349,14 +376,14 @@ resource "aws_ecs_task_definition" "orders" {
 
 ## 6. Verify the Whole Configuration Together
 
-Every resource block above, concatenated into one `main.tf` plus the two input variables from [§2](#2-two-ecs-clusters-and-the-orders-service-each-one-deploys), is a real Terraform configuration — not fragments that only look plausible next to each other. Running it through `terraform init` and `terraform validate` catches the failure mode this note would most embarrassingly ship with: a resource argument or reference that doesn't actually exist in the AWS provider.
+Every resource block above, concatenated into one `main.tf` plus the three input variables from [§2](#2-two-ecs-clusters-and-the-orders-service-each-one-deploys), is a real Terraform configuration — not fragments that only look plausible next to each other. Running it through `terraform init` and `terraform validate` catches the failure mode this note would most embarrassingly ship with: a resource argument or reference that doesn't actually exist in the AWS provider.
 
 ```text
 $ terraform init -backend=false -input=false -no-color
 Initializing provider plugins...
-- Finding hashicorp/aws versions matching "~> 5.0"...
-- Installing hashicorp/aws v5.100.0...
-- Installed hashicorp/aws v5.100.0 (signed by HashiCorp)
+- Finding hashicorp/aws versions matching "~> 6.0"...
+- Installing hashicorp/aws v6.0.0...
+- Installed hashicorp/aws v6.0.0 (signed by HashiCorp)
 
 Terraform has been successfully initialized!
 

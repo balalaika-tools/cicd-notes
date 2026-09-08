@@ -27,9 +27,12 @@ A rollback that redeploys the previous container image cannot undo a destroyed s
 - name: Apply the reviewed plan
   run: |
     set -euo pipefail
-    terraform apply -input=false -lock-timeout=5m tfplan
-    terraform show -json tfplan > applied.json  # recovery record: exactly what changed
+    terraform apply -input=false -lock-timeout=5m tfplan | tee apply.log
+    terraform show -json > post-apply-state.json
+    terraform output -json > post-apply-outputs.json
 ```
+
+Keep `tfplan`/its JSON as approval evidence; it describes the saved plan and prior/planned values, not resulting applied state. The recovery record links the plan digest, `apply.log`, post-apply state/outputs or provider observation, workflow run, and apply identity.
 
 **Success signal:** `terraform plan` exits `0` and prints a `Plan: N to add, M to change, P to destroy` summary matching the intended change (here, `1 to add, 1 to change, 0 to destroy`); `terraform apply` then exits `0` against that same saved plan, with no `Error: Saved plan is stale` message.
 
@@ -95,11 +98,24 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
+      - name: Assume the production read role
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/terraform-production-plan
+          aws-region: eu-west-1
+
+      - name: Assert identity, backend, and workspace
+        run: |
+          set -euo pipefail
+          test "$(aws sts get-caller-identity --query Account --output text)" = 123456789012
+          terraform init -input=false -backend-config="key=orders/production.tfstate"
+          test "$(terraform workspace show)" = production
+
       - name: Format and initialize
         run: |
           set -euo pipefail
           terraform fmt -check -recursive
-          terraform init -input=false
+          terraform init -input=false -backend-config="key=orders/production.tfstate"
 
       - name: Validate and plan
         run: |
@@ -109,6 +125,23 @@ jobs:
             -input=false \
             -lock-timeout=5m \
             -no-color > plan.txt
+
+      - name: Publish a sanitized immutable review artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          ./scripts/sanitize-terraform-plan.sh plan.txt > plan.sanitized.txt
+          sha256sum plan.sanitized.txt > plan.sanitized.txt.sha256
+          gh pr comment "$PR_NUMBER" --body "Terraform plan artifact: tf-plan-$GITHUB_RUN_ID; digest: $(cut -d' ' -f1 plan.sanitized.txt.sha256)"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tf-plan-${{ github.run_id }}
+          path: |
+            infra/environments/production/plan.sanitized.txt
+            infra/environments/production/plan.sanitized.txt.sha256
+          if-no-files-found: error
 ```
 
 The payoff a reviewer checks is the `Plan: N to add, M to change, P to destroy` line at the end of `plan.txt` — that summary is what should match the PR's stated intent. Both `terraform init` and `terraform plan` exit `0` on success regardless of which backend or workspace they ran against, so a clean exit status alone proves nothing about *where* the plan ran. The common silent failure is a plan against the wrong backend or workspace: initialization succeeds, the plan prints a small, clean-looking summary, and it's clean only because it's comparing against the wrong state file. Confirm the backend key and `terraform workspace show` in the job output before trusting a suspiciously quiet plan.
@@ -182,6 +215,22 @@ scheduled read-only plan
          ├── expected emergency/manual change → import or codify through PR
          └── unexpected change → investigate and reconcile
 ```
+
+Run the read-only identity and backend/workspace assertions from section 2, then:
+
+```bash
+set +e
+terraform plan -refresh-only -detailed-exitcode -input=false -lock=false -no-color
+status=$?
+set -e
+case "$status" in
+  0) echo "NO_DRIFT account=123456789012 workspace=production key=orders/production.tfstate" ;;
+  2) echo "DRIFT_DETECTED owner=platform-oncall"; exit 2 ;;
+  *) echo "DRIFT_CHECK_ERROR" >&2; exit 1 ;;
+esac
+```
+
+Exit `0` is no drift, `2` is a real diff, and `1` is an error. The comparison is the named backend/workspace state versus the live provider API under the asserted read role. Platform on-call triages drift; any reconciliation is a separate reviewed plan/apply, never an automatic response to an unexplained diff.
 
 > **Production:** do not automatically overwrite unexplained production drift. It may indicate an incident, an emergency repair, or a compromised identity — an automated "fix" at that point could erase the evidence.
 
@@ -261,10 +310,10 @@ Every intermediate state must support the versions that can coexist during rolli
 
 A **backfill** is the job that populates the newly added shape for rows that already existed before the expand release shipped — new writes get both the old and new fields going forward, but rows written earlier need a bulk job to catch up. That job runs against live production tables, competing with real traffic for locks, I/O, and connections, so it needs the same operational controls as any other production workload:
 
-- idempotent and resumable;
-- partitioned into bounded batches;
-- rate-limited;
-- observable;
+- **★ idempotent and resumable;**
+- **★ partitioned into bounded batches;**
+- **★ rate-limited;**
+- **★ observable;**
 - pauseable;
 - protected against concurrent execution;
 - verified with domain invariants;
@@ -278,6 +327,8 @@ python -m tools.backfill_customer_names \
   --checkpoint-table operations.backfill_progress
 ```
 
+The launch-blocking subset is those four starred controls plus single-run protection. A restart from checkpoint `customer_id=42000` reports `processed=500 next_checkpoint=42500 rate=198/s`; rerunning with the same checkpoint changes zero already-completed rows and advances deterministically.
+
 > **Production:** do not hide a multi-hour backfill inside a deployment job timeout. Treat it as an operation with its own lifecycle and its own release dependency — the release that switches reads to the new field waits on the backfill's completion signal, not on a deploy step finishing.
 
 ---
@@ -288,12 +339,14 @@ python -m tools.backfill_customer_names \
 
 Before a high-risk migration:
 
-- verify backup recency and scope;
-- test restore procedures;
-- measure restore time against recovery objectives;
-- know which later writes would be lost;
+- **★ verify backup recency and scope;**
+- **★ test restore procedures;**
+- **★ measure restore time against recovery objectives;**
+- **★ know which later writes would be lost;**
 - capture schema and migration version;
-- define who authorizes restore.
+- **★ define who authorizes restore.**
+
+Before launch, record `backup_id=orders-20260908T0200Z`, `scope=orders-prod`, `authorized_by=incident-commander`, and a tested restore result with elapsed time. A backup for another database, an expired recovery point, or missing authorization blocks restore before any live target is overwritten.
 
 Restoring a database can be much more disruptive than rolling forward with a corrective migration, because a restore discards every write made since the backup, not just the migration's effects. Prefer compatibility and reversible steps over relying on restore.
 

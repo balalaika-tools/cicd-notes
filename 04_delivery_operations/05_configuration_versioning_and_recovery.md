@@ -4,7 +4,7 @@
 
 ## The short version
 
-A rollback redeploys the previous artifact digest — the immutable content hash from [promotion's release manifest](01_environments_and_promotions.md#2-promotion-moves-an-immutable-identity) — health checks turn green, and the same incident returns twelve minutes later, because the mutable configuration store still holds whatever values the bad release left behind. A digest pins which bytes run; it says nothing about which **configuration** — the resolved runtime settings and feature-flag states those bytes actually read at startup and on each request — they were tested against. Give configuration the same version discipline a digest already has: a content-hash **configuration version** that travels in the release manifest, a validation gate before it can promote, a snapshot of what was actually resolved, and a restore step that pairs it back to the digest during rollback.
+A rollback redeploys the previous artifact digest, health checks turn green, and the incident returns because the mutable configuration store still holds the bad release's values. A digest pins which bytes run; it says nothing about which **configuration** — runtime settings plus each **feature flag**, an externally evaluated rule/value that selects a code path for a request or cohort — those bytes actually observed. Give configuration version discipline: carry desired source identity, control-plane applied version, immutable secret-version references, evaluation context, and a workload-observed fingerprint alongside the digest.
 
 **What you need (4 things):**
 
@@ -203,21 +203,18 @@ A flag-definition list answers "what flags could this service check" — it says
 {
   "environment": "production",
   "digest": "sha256:4ae0...9c1d",
-  "config_version": "sha256:46ea...9275",
-  "bundle": "s3://acme-config-bundles/orders/production/2026-08-10T10-00-00Z.json",
-  "resolved_at": "2026-08-10T10:00:00Z",
-  "resolved_values": {
-    "log_level": "info",
-    "rate_limit_per_minute": 500,
-    "feature_flags": {
-      "new_checkout": true,
-      "recommendation_v2": false
-    }
-  }
+  "desired_source_version": "git:8f31c2a:config/production.json",
+  "control_plane_applied_version": "appconfig:deployment-184",
+  "secret_version_references": {"payments_key": "secretsmanager:AWSPREVIOUS/7b2c"},
+  "evaluation_context": {"cohort": "internal-users", "region": "eu-west-1"},
+  "workload_effective_fingerprint": "sha256:46ea...9275",
+  "observed_at": "2026-08-10T10:00:00Z"
 }
 ```
 
-`resolved_values` is a copy of exactly what the earlier validation step already canonicalized and hashed — not a re-derivation, and not a pointer that could later resolve to something different. Append one line per deployment to the same append-only deployment record `resolve-rollback-target.sh` reads:
+The desired hash is not a snapshot of effective runtime state: a secret can rotate behind the same reference and a flag can evaluate differently by cohort. Claim runtime state only when all five external observations above were captured at deployment time.
+
+Persist one record per deployment in a durable external store. For example, a DynamoDB table owned by the platform team grants the deploy role `PutItem` only, denies update/delete, uses a conditional key to serialize duplicates, enables point-in-time recovery and CloudTrail writer audit, and exports tamper-evident archives:
 
 ```bash
 #!/usr/bin/env bash
@@ -226,16 +223,16 @@ set -euo pipefail
 environment="${1:?usage: append-deployment-record.sh ENVIRONMENT DIGEST CONFIG_VERSION}"
 digest="${2:?usage: append-deployment-record.sh ENVIRONMENT DIGEST CONFIG_VERSION}"
 config_version="${3:?usage: append-deployment-record.sh ENVIRONMENT DIGEST CONFIG_VERSION}"
-record_file="${DEPLOYMENT_RECORD:-deployment-record.jsonl}"
-
-# Append-only: never edit or delete a prior line, only add the newest one --
-# resolve-paired-configuration.sh (§5) depends on being able to trust every
-# entry it has ever seen.
-jq -nc --arg env "$environment" --arg digest "$digest" --arg cv "$config_version" \
-  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{environment:$env, digest:$digest, config_version:$cv, deployed_at:$ts}' \
-  >> "$record_file"
+record_id="${GITHUB_RUN_ID:?}-${environment}"
+aws dynamodb put-item --table-name deployment-records \
+  --condition-expression 'attribute_not_exists(record_id)' \
+  --item "$(jq -nc --arg id "$record_id" --arg env "$environment" \
+    --arg digest "$digest" --arg cv "$config_version" --arg writer "${AWS_ROLE_ARN:?}" \
+    '{record_id:{S:$id},environment:{S:$env},digest:{S:$digest},config_version:{S:$cv},writer:{S:$writer}}')"
+echo "record_id=$record_id"
 ```
+
+Read the item back by `record_id` and compare every field before linking it from the deployment. A duplicate writer receives `ConditionalCheckFailedException`; a runner-local append is never accepted as durable evidence.
 
 > **Production:** never let `resolved_values` include a secret. If a bundle references a secret manager path, snapshot the path, not the value it resolves to at runtime — the append-only record is exactly the kind of broadly-readable, incident-response-friendly store that should never double as a secret log. This is the same rule §2 states for the bundle itself, extended to what gets copied out of it.
 
@@ -251,16 +248,12 @@ set -euo pipefail
 
 environment="${1:?usage: resolve-paired-configuration.sh ENVIRONMENT DIGEST}"
 digest="${2:?usage: resolve-paired-configuration.sh ENVIRONMENT DIGEST}"
-record_file="${DEPLOYMENT_RECORD:-deployment-record.jsonl}"
+match="$(aws dynamodb query --table-name deployment-records \
+  --key-condition-expression 'environment = :e AND digest = :d' \
+  --expression-attribute-values "{\":e\":{\"S\":\"$environment\"},\":d\":{\"S\":\"$digest\"}}" \
+  --consistent-read --query 'Items[0].config_version.S' --output text)"
 
-# The deployment record is append-only (§4), so the last matching line is
-# the pairing that was actually live -- never derive a "closest" or
-# "current" value when the exact pairing is missing.
-match="$(jq -r --arg env "$environment" --arg digest "$digest" \
-  'select(.environment == $env and .digest == $digest) | .config_version' \
-  "$record_file" | tail -n1)"
-
-if [[ -z "$match" ]]; then
+if [[ -z "$match" || "$match" == None ]]; then
   echo "FAIL: no configuration version is paired with ${digest} in ${environment} -- refusing to guess" >&2
   exit 1
 fi
@@ -268,7 +261,7 @@ fi
 echo "$match"
 ```
 
-Insert it into the rollback workflow between resolving the digest and deploying it — restoring configuration *before* the old binary starts, not after:
+Do not restore old configuration while an incompatible new binary is serving. Either prove a bidirectional compatibility window, or stage the old binary at zero traffic, apply its paired configuration with compare-and-set semantics, verify both identities there, and atomically cut traffic over. If neither is possible, halt for operator-directed roll-forward.
 
 ```yaml
       - name: Resolve rollback target from the deployment record
@@ -284,18 +277,63 @@ Insert it into the rollback workflow between resolving the digest and deploying 
           config_version="$(./scripts/resolve-paired-configuration.sh production "$DIGEST")"
           echo "config_version=$config_version" >> "$GITHUB_OUTPUT"
 
-      - name: Restore paired configuration
+      - name: Stage previous digest with zero traffic
+        run: ./scripts/stage-production.sh "ghcr.io/acme/orders@${{ steps.resolve.outputs.digest }}" --traffic-percent 0
+
+      - name: Restore paired configuration through AWS AppConfig
+        id: apply_config
         env:
           CONFIG_VERSION: ${{ steps.resolve_config.outputs.config_version }}
-        run: ./scripts/apply-configuration.sh production "$CONFIG_VERSION"
+          EXPECTED_CURRENT_VERSION: ${{ needs.capture-current.outputs.config_version }}
+        run: ./scripts/apply-appconfig.sh production "$EXPECTED_CURRENT_VERSION" "$CONFIG_VERSION"
 
-      - name: Deploy previous digest
-        env:
-          DIGEST: ${{ steps.resolve.outputs.digest }}
-        run: ./scripts/deploy-production.sh "ghcr.io/acme/orders@$DIGEST"
+      - name: Verify staged pairing and cut traffic over
+        run: |
+          ./scripts/verify-staged-pair.sh \
+            "${{ steps.resolve.outputs.digest }}" \
+            "${{ steps.apply_config.outputs.applied_version }}"
+          ./scripts/switch-production-traffic.sh --to staged --atomic
 ```
 
-Configuration goes first. If it went last, the old binary would boot and briefly serve traffic against whatever configuration the *failed* release left behind — the exact gap §1's scenario shows. Restoring configuration first means the worst case is the still-running new binary reading old configuration for a few seconds, which it was already about to be replaced anyway; the reverse order means the *reintroduced* old binary runs against untested configuration, which is the failure this whole mechanism exists to close.
+`apply-appconfig.sh` accepts only the reviewed application/environment/profile mapping, verifies the currently applied version equals `EXPECTED_CURRENT_VERSION`, starts the deployment, returns its deployment number as `applied_version`, and polls with a timeout until AppConfig reports complete. `verify-staged-pair.sh` then requires the zero-traffic workload to report both the target digest and effective configuration fingerprint. A compare-and-set mismatch, timeout, or workload mismatch aborts before traffic moves.
+
+The canonical adapter's control-plane interaction is:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+target="${1:?production only}"
+expected_current="${2:?expected current version}"
+restore_version="${3:?restore version}"
+test "$target" = production
+
+application_id=a1b2c3d
+environment_id=e1f2g3h
+profile_id=p1q2r3s
+current="$(./scripts/get-appconfig-applied-version.sh "$application_id" "$environment_id" "$profile_id")"
+test "$current" = "$expected_current" # compare-and-set: refuse concurrent drift
+
+deployment_number="$(aws appconfig start-deployment \
+  --application-id "$application_id" \
+  --environment-id "$environment_id" \
+  --configuration-profile-id "$profile_id" \
+  --configuration-version "$restore_version" \
+  --deployment-strategy-id AppConfig.AllAtOnce \
+  --query DeploymentNumber --output text)"
+
+for _ in $(seq 1 60); do
+  state="$(aws appconfig get-deployment --application-id "$application_id" \
+    --environment-id "$environment_id" --deployment-number "$deployment_number" \
+    --query State --output text)"
+  case "$state" in
+    COMPLETE) echo "applied_version=$deployment_number"; exit 0 ;;
+    ROLLING_BACK|ROLLED_BACK|REVERTED) echo "restore failed: $state" >&2; exit 1 ;;
+  esac
+  sleep 5
+done
+echo "restore timed out" >&2
+exit 1
+```
 
 `resolve-paired-configuration.sh` failing is not an error to work around — it's the workflow correctly refusing to redeploy a combination nobody ever ran in production, exactly as `resolve-rollback-target.sh` refuses a revoked or non-adjacent digest. An operator hitting this mid-incident has one honest option: treat the missing pairing as its own incident finding, not a step to bypass by manually picking "whatever config looks current."
 
@@ -343,8 +381,12 @@ config_version=sha256:46ea6fe68d1f7f9113ea3c70b432774694ca469b68e8bb0f136d49e1d7
 OK: schema and policy checks passed for production
 
 $ ./scripts/append-deployment-record.sh production "sha256:4ae0...9c1d" "sha256:46ea...9275"
-$ cat deployment-record.jsonl
-{"environment":"production","digest":"sha256:4ae0...9c1d","config_version":"sha256:46ea...9275","deployed_at":"2026-08-14T14:34:02Z"}
+record_id=8912345678-production
+
+$ aws dynamodb get-item --table-name deployment-records \
+    --key '{"environment":{"S":"production"},"digest":{"S":"sha256:4ae0...9c1d"}}' \
+    --query 'Item.{record_id:record_id.S,config_version:config_version.S}'
+{"record_id":"8912345678-production","config_version":"sha256:46ea...9275"}
 
 $ ./scripts/resolve-paired-configuration.sh production sha256:4ae0...9c1d
 sha256:46ea...9275

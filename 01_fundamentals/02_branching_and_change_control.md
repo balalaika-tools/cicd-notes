@@ -1,6 +1,6 @@
 # Branching and Production Change Control
 
-> **Who this is for**: Teams deciding how source changes become authorized release candidates.
+> **Who this is for**: Teams deciding how source changes become authorized **release candidates** — specific built artifacts eligible for promotion after the required evidence passes.
 
 ## The short version
 
@@ -32,6 +32,24 @@ Four concrete inputs are enough to make that guarantee hold for every change, in
 
 When she opens the pull request, GitHub requests review from `@acme/payments-team` and disables the merge button until a member of that team approves and `required-ci` reports success on her exact commit.
 An approval from `@acme/application-team`, or a passing check on an earlier commit, satisfies neither requirement.
+
+The effective server-side rule must also be inspected. This abbreviated exported ruleset is a concrete carrier, not a file the repository itself owns:
+
+```json
+{
+  "name": "main-change-control",
+  "enforcement": "active",
+  "target": "branch",
+  "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"]}},
+  "bypass_actors": [],
+  "rules": [
+    {"type": "pull_request", "parameters": {"required_approving_review_count": 1, "require_code_owner_review": true}},
+    {"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "required-ci", "integration_id": 15368}]}}
+  ]
+}
+```
+
+The repository proves the `CODEOWNERS` mapping and workflow definition. A repository or organization administrator must query every active repository-, organization-, and enterprise-level ruleset targeting `main` and confirm enforcement mode, bypass actors, review count, code-owner review, and both the check name and expected source App. Without that access those facts remain `unknown`. The negative proof is a PR that changes `/src/payments/`, has only a non-owner approval or a same-named status from another source, and remains blocked.
 
 **Success signal:** The merge box reads "Review required from @acme/payments-team," and the merge button stays disabled until that review lands and `required-ci` is green on the current commit.
 
@@ -231,7 +249,8 @@ moment another pull request merges ahead of it — two changes that are individu
 can still misbehave once combined. A **merge queue** serializes this: instead of merging
 an approved PR straight into `main`, GitHub creates a temporary integration branch
 combining it with `main` plus any other approved PRs ahead of it, re-runs required checks
-against that combination, and only then fast-forwards `main`.
+against that combination, and only then updates `main` using the configured merge, rebase,
+or squash method. That method is external queue configuration, not workflow-owned behavior.
 
 ```text
 approved PR A ─┐
